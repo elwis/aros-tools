@@ -22,13 +22,16 @@
 #include <utility/hooks.h>
 #include <clib/alib_protos.h>
 
-/* BSD socket */
+/* BSD socket — per-task SocketBase pattern required on AROS hosted networking.
+ * Global SocketBase causes Exec_OpenResource crash; tc_UserData is the fix. */
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <proto/socket.h>
+#define SocketBase FindTask(NULL)->tc_UserData
+#define __BSDSOCKET_NOLIBBASE__
+#include <proto/bsdsocket.h>
 #include <bsdsocket/socketbasetags.h>
 
 #include <stdio.h>
@@ -50,7 +53,6 @@
  * ================================================================ */
 
 struct Library *MUIMasterBase = NULL;
-struct Library *SocketBase    = NULL;
 
 /* ================================================================
  * FTP state
