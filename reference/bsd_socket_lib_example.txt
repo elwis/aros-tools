@@ -1,0 +1,3884 @@
+Usage
+
+Using bsdsocket.library is not hard, you need to add the AmiTCP-SDKs in your include-path and include <bsdsocket.h>, <netdb.h> and <proto/socket.h>. It's like using any other shared library - you can utilize its functions after opening it with exec.library/OpenLibrary(). After that, it is more or less identical to programming the BSD sockets API, as far as the networking is concerned.
+
+create socket
+set sock addr
+set sock port
+open socket
+send socket ( request_string )
+receive result
+
+then write the input buffer to standard output or to a file 
+
+A few of these functions have macros for easier use (select, inet_ntoa, etc.), but you must use CloseSocket and IoctlSocket in place of close and ioctl. Bsdsocket.library has its own ernno, which can be queried with Errno() or you can make it use the errno variable using SetErrnoPtr() or SocketBaseTagList()
+
+Before calling the bsd functions, make sure the bsdsocket.library is opened, if not then its very normal that is where it crashes...
+
+net_udp.c contains...
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <sys/param.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+
+#include <proto/socket.h> 
+#include <sys/socket.h> 
+#include <bsdsocket/socketbasetags.h>
+
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#ifdef __AROS__
+#include proto/bsdsocket.h
+#endif
+
+#ifdef NeXT
+#include libc.h
+#endif
+
+and uncomment them
+
+//extern int gethostname (char *, int);
+//extern int close (int);
+
+For example, you create a socket with socket() (from bsdsocket.library) and then you pass it to write() from arosc, but this integer value means something different to arosc. Same with other way around, using fd created by arosc with bsdsocket.library.
+
+Every bsdsocket.library call takes SocketBase as an argument, and since you declared a global NULL SocketBase socket functions will fail. To solve the problem, you can include the header below instead of proto/bsdsocket.h, and use SocketBase as normal, which will become the taks's user defined field. Please note that you have to do call init_arossock() in the right thread, preferably in a wrapper around exec_list, and don't declare a global SocketBase variable.
+
+#ifndef TASKSOCKBASE_H
+#define TASKSOCKBASE_H
+
+/*
+ * Per-task socketbase using tc_UserData
+ */
+
+#include <proto/exec.h>
+
+#define SocketBase FindTask(NULL)->tc_UserData
+#define __BSDSOCKET_NOLIBBASE__
+#include <proto/bsdsocket.h>
+
+#endif
+
+As far as i know WaitSelect() works just like select() and would be nice to paste bit of the code here where it fails... WaitSelect can only be used on sockets, not on DOS filehandles. On unix they are handled uniformly, but on Amiga you have to use different code path for file handles and sockets.
+
+sys/select.h
+---------------
+#ifndef select(nfds,rfds,wfds,efds,timeout)
+#define select(nfds,rfds,wfds,efds,timeout) WaitSelect(nfds,rfds,wfds,efds,timeout,NULL)
+#endif
+
+and the test the select
+
+struct timeval timeout;
+int socket_d;
+struct fd_set client_d;
+
+//set to 3 mins
+timeout.tv_sec = 3 * 60;
+timeout.tv_usec = 0;
+
+do
+{
+
+rc = select(socket_d + 1, &client_d, NULL, NULL, &timeout);
+
+/* Check to see if the select call failed. */
+if (rc < 0)
+{
+perror(" select() failed");
+break;
+}
+
+/* Check to see if the 3 minute time out expired. */
+if (rc == 0)
+{
+printf(" select() timed out. End program.\n");
+break;
+}
+}
+
+
+One of the arguments of LockMutex is still NULL, it could be ThreadBase too. One thing I noticed is that you don't use pthread_join/WaitThread in your code. Instead you do busy loops until the given thread sets its state. Because one of the functions which overflows the stack is wait_thread_running().
+
+LockMutex fails in exe_elist(), because cclist_mutex is not initialized for AROS in main.c, hence the NULL pointer.
+
+Initializing cclist_mutex solves the problem. Here are the two thread-waiting functions without the busy loop:
+
+void wait_thread_running (S4 threadnum)
+{
+    LockMutex (pthreads_mutex);
+    if (pthreads[threadnum].thread)
+        WaitThread(pthreads[threadnum].thread, NULL);
+    UnlockMutex (pthreads_mutex);
+}
+
+void join_threads (S4 threadnum)
+{
+    /* wait until all threads are stopped */
+    S4 i;
+    
+    LockMutex (pthreads_mutex);
+    /* thread zero is the main thread, don't wait for it!!! */
+    for (i = 1; i < MAXPTHREADS; i++)
+    {
+        /* don't check the calling thread!!! */
+        if (i != threadnum && pthreads[i].thread)
+        {
+            WaitThread(pthreads[i].thread, NULL);
+        }
+    }
+    UnlockMutex (pthreads_mutex);
+}
+
+Replacing WaitThread with pthread_join would work on other platforms. Checking (pthreads[i].state == PTHREAD_RUNNING) isn't necessary anymore, since these thread waiting functions instantly return on terminated threads.
+
+It's waiting till the thread is started (was created). It's the thread_sync function in the examples. This is for synchronizing threads. The next step would be sending data to the thread: with threadpush ().
+
+Also make sure that to open bsdsocket.library in the same thread where you do the socket operations, because you can't share socket descriptors between threads. Technically it's possible to pass sds between threads, but it requires some extra code, and generally not worth the hassle if you can move all the socket manipulation into one thread.
+
+Do you know that bsdsocket API has support for fd hooks. They allow to sync up fd numbers between bsdsocket.library and libc. If you look at original netlib code, you'll see it. That implementation is based on some support from SAS/C libc.
+
+#include <proto/exec.h>
+struct Library * SocketBase = NULL;
+int h_errno = 0;
+extern int errno;
+
+and then in the initialization code:
+
+if(!(SocketBase = OpenLibrary("bsdsocket.library", 4 ))) {
+SDLNet_SetError("No TCP/IP Stack running!\n");
+return(-1);
+}
+
+if( SocketBaseTags(SBTM_SETVAL(SBTC_ERRNOPTR(sizeof(errno))), (IPTR)&errno,
+SBTM_SETVAL(SBTC_HERRNOLONGPTR), (IPTR)&h_errno, TAG_DONE )) {
+SDLNet_SetError("Error initializing bsdsocket\n");
+return(-1);
+}
+
+    Under AROS you need -larossupport instead of -ldebug.
+    If using SDL and its' functions, you will need -lsdl
+    make sure ioctl or ioctlsocket is defined to IoctlSocket, and close to CloseSocket.
+
+AmiTCP contains the bare necessities to perform DNS lookups through an early version of the libresolv code, which is baked into it. Problem here is that you cannot retrofit this API. You might be able to emulate it. You might be able to use conditional compilation to have the client code call the old clunky API instead of the shinier version we don't have. You might be able to simply drop in a more recent version of the libresolv code than what exists as part of the AmiTCP API.
+
+A lot has changed within the socket API in the past decades, and the same is true for the libresolv code. New functions and data structures were tacked on which make accessing the fundamental API services less clunky and more convenient. These niceties passed us by, because the AmiTCP API has remained virtually unchanged since its inception.
+Examples
+
+/*
+    Copyright � 2002, The AROS Development Team.
+    All rights reserved.
+
+    $Id$
+*/
+
+#include    <exec/types.h>
+#include    <stdlib.h>
+#include    <stdio.h>
+#include    <string.h>
+#include    <ctype.h>
+
+#include    <proto/alib.h>
+#include    <proto/exec.h>
+#include    <proto/dos.h>
+#include    <proto/intuition.h>
+#include    <proto/muimaster.h>
+#include    <proto/graphics.h>
+#include    <proto/utility.h>
+
+#include    <dos/dos.h>
+#include    <intuition/gadgetclass.h>
+#include    <intuition/icclass.h>
+#include    <clib/alib_protos.h>
+
+#include <libraries/mui.h>
+#include <mui/NListtree_mcc.h>
+#include <mui/NListview_mcc.h>
+#include <mui/NList_mcc.h>
+//#include <MUI/BetterString_mcc.h>
+
+#include <utility/hooks.h>
+
+/* Start Network Includes */
+#include <proto/socket.h>
+#include <bsdsocket/socketbasetags.h>
+//#include <sys/param.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/errno.h>
+
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#include "aircos_global.h"
+#include "locale.h"
+
+/* Texteditor + custom attributes */
+#include <mui/TextEditor_mcc.h>
+#define MUIA_CustTextEditor_ChannelPrivate (TextEditor_Dummy + 0xf01)
+#define MUIA_CustTextEditor_ServerPrivate  (TextEditor_Dummy + 0xf02)
+
+/* Menu IDs */
+#define AiRcOS_MENUID_CONNECT          (AiRcOS_MENUID + 1)
+#define AiRcOS_MENUID_CLOSE            (AiRcOS_MENUID + 2)
+#define AiRcOS_MENUID_QUIT             (AiRcOS_MENUID + 3)
+#define AiRcOS_MENUID_PREFS            (AiRcOS_MENUID + 4)
+#define AiRcOS_MENUID_SERVERMANAGE     (AiRcOS_MENUID + 5)
+#define AiRcOS_MENUID_HELP             (AiRcOS_MENUID + 6)
+#define AiRcOS_MENUID_ABOUT            (AiRcOS_MENUID + 7)
+
+/*
+#define AiRcOS_MENUID_CONNECT          (AiRcOS_MENUID + 1)
+#define AiRcOS_MENUID_CLOSE            (AiRcOS_MENUID + 2)
+#define AiRcOS_MENUID_QUIT             (AiRcOS_MENUID + 3)
+#define AiRcOS_MENUID_PREFS            (AiRcOS_MENUID + 4)
+#define AiRcOS_MENUID_SERVERMANAGE     (AiRcOS_MENUID + 1)
+#define AiRcOS_MENUID_HELP             (AiRcOS_MENUID + 5)
+#define AiRcOS_MENUID_ABOUT            (AiRcOS_MENUID + 6)
+
+#define AiRcOS_MENUID_CONNECT          (AiRcOS_MENUID + 1)
+#define AiRcOS_MENUID_CLOSE            (AiRcOS_MENUID + 2)
+#define AiRcOS_MENUID_QUIT             (AiRcOS_MENUID + 3)
+#define AiRcOS_MENUID_PREFS            (AiRcOS_MENUID + 4)
+#define AiRcOS_MENUID_SERVERMANAGE     (AiRcOS_MENUID + 1)
+#define AiRcOS_MENUID_HELP             (AiRcOS_MENUID + 5)
+#define AiRcOS_MENUID_ABOUT            (AiRcOS_MENUID + 6)
+
+#define AiRcOS_MENUID_CONNECT          (AiRcOS_MENUID + 1)
+#define AiRcOS_MENUID_CLOSE            (AiRcOS_MENUID + 2)
+#define AiRcOS_MENUID_QUIT             (AiRcOS_MENUID + 3)
+#define AiRcOS_MENUID_PREFS            (AiRcOS_MENUID + 4)
+#define AiRcOS_MENUID_SERVERMANAGE     (AiRcOS_MENUID + 1)
+#define AiRcOS_MENUID_HELP             (AiRcOS_MENUID + 5)
+#define AiRcOS_MENUID_ABOUT            (AiRcOS_MENUID + 6)
+*/
+
+extern int aircos_IRC_donumeric(struct IRC_Connection_Private	*currentConnection, int num);
+extern int aircos_IRC_nop(struct IRC_Connection_Private	*currentConnection);
+extern struct IRC_Server_Priv  *aircos_add_server(char *addserv);
+extern Object	*aircos_showServerConnect();
+extern char *FormatToSend(char *unformatted_string);
+extern char *FormatToDisplay(char *formatted_string);
+extern BOOL aircosApp_loadPrefs();
+
+extern char                          *aircos_Prefs_DefUser;
+extern char                          *aircos_Prefs_DefNick;
+extern struct functionrecord         commandList_array[];
+extern struct aircos_servernode      *aircos_Prefs_ServerActive;
+Object	                            *serverconnectWin;
+
+#define INTERNALFUNCID(functionID) (functionID + 1)
+
+struct intern_functionrecord
+{
+   struct Node           ifr_Node;
+   struct functionrecord ifr_command;
+};
+
+extern int aircos_IRCFuncs_RegisterFuncs(void);
+//extern int aircos_DCCFuncs_RegisterFuncs(void);
+
+struct AiRcOS_internal *AiRcOS_Base;
+
+BOOL aircosApp__OpenBSDSOCKET()
+{
+D(bug("[AiRcOS] aircosApp__OpenBSDSOCKET()\n"));
+    if (AiRcOS_Base->Ai_SocketBase!=NULL) return TRUE;
+
+    if ((AiRcOS_Base->Ai_SocketBase = OpenLibrary("bsdsocket.library",3)))
+    {
+        if ((AiRcOS_Base->Ai_sigbit_ProcessStack=AllocSignal(-1))!=-1)
+        {
+            if (SocketBaseTags(SBTM_SETVAL(SBTC_ERRNOLONGPTR), &AiRcOS_Base->Ai_errno,
+                    SBTM_SETVAL(SBTC_HERRNOLONGPTR), &AiRcOS_Base->Ai_herrno,
+                    SBTM_SETVAL(SBTC_SIGIOMASK), 1<<AiRcOS_Base->Ai_sigbit_ProcessStack,
+                    TAG_END)<=0)
+            {
+                return TRUE;
+            }
+            else
+            {
+D(bug("[AiRcOS](openbsdsocket) Couldnt Set socketbase!\n"));
+            }
+            FreeSignal(AiRcOS_Base->Ai_sigbit_ProcessStack);
+        }
+        else
+        {
+D(bug("[AiRcOS](openbsdsocket) Couldnt allocate sigbit_ProcessStack!\n"));
+        }
+        CloseLibrary(SocketBase);
+        SocketBase=0;
+    }
+
+    return FALSE;
+}
+
+/**************************************/
+/* Custom TextEditor class dispatcher */
+/**************************************/
+
+struct CustomTEInstData
+{
+  struct  MUI_EventHandlerNode   ehnode;           /* Enable us to trap input events                      */
+  struct IRC_Channel_Priv        *cte_ChanPriv;
+  struct IRC_Server_Priv         *cte_ServPriv;
+  char                           *partialNameToMatch;
+  char                           *currentNameMatch;
+  ULONG									partMatchY;
+  ULONG									partMatchMinX;
+  ULONG									partMatchMaxX;
+};
+
+BOOPSI_DISPATCHER(IPTR, TextEditor_Dispatcher, CLASS, self, message)
+{
+
+D(bug("[AiRcOS] TextEditor_Dispatcher(obj:%x, Method:%x)\n", self, message->MethodID));
+  switch(message->MethodID)
+  {
+  case MUIM_Setup:
+  {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_Setup\n"));
+    struct CustomTEInstData *data = INST_DATA(CLASS, self);
+    if ((data->cte_ChanPriv)||(data->cte_ServPriv))
+    {
+      /* Only capture events in our input gadgets */
+      data->ehnode.ehn_Priority = 0;
+      data->ehnode.ehn_Flags    = 0;
+      data->ehnode.ehn_Object   = self;
+      data->ehnode.ehn_Class    = CLASS;
+      data->ehnode.ehn_Events   = IDCMP_RAWKEY;
+
+      DoMethod(_win(self), MUIM_Window_AddEventHandler, &data->ehnode);
+    }
+    break;
+  }
+  case OM_NEW:
+  {
+D(bug("[AiRcOS] TextEditor_Dispatcher: OM_NEW\n"));
+    if((self = (Object *)DoSuperMethodA(CLASS, self, (Msg)message)))
+    {
+      struct CustomTEInstData *data = INST_DATA(CLASS, self);
+
+      data->cte_ChanPriv = (struct IRC_Channel_Priv *)GetTagData (MUIA_CustTextEditor_ChannelPrivate, (IPTR) NULL, ((struct opSet *)message)->ops_AttrList);;
+      data->cte_ServPriv = (struct IRC_Server_Priv *)GetTagData (MUIA_CustTextEditor_ServerPrivate, (IPTR) NULL, ((struct opSet *)message)->ops_AttrList);;
+      return (IPTR)self;
+    }
+    return FALSE;
+    break;
+  }
+  case OM_DISPOSE:
+  {
+D(bug("[AiRcOS] TextEditor_Dispatcher: OM_DISPOSE\n"));
+    break;
+  }
+  case MUIM_Cleanup:
+  {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_Cleanup\n"));
+    struct CustomTEInstData *data = INST_DATA(CLASS, self);
+    if ((data->cte_ChanPriv)||(data->cte_ServPriv))
+    {
+      DoMethod(_win(self), MUIM_Window_RemEventHandler, &data->ehnode);
+    }
+    break;
+  }
+
+		case MUIM_Show:
+		{
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_Show\n"));
+				struct ColorMap *cm = muiRenderInfo(self)->mri_Screen->ViewPort.ColorMap;
+
+/* IRC Colors
+
+   BLACK
+   DARK BLUE
+   DARK GREEN
+   GREEN
+   RED
+   LIGHT RED
+   DARK RED
+   PURPLE
+   BROWN
+   ORANGE
+   YELLOW
+   LIGHT GREEN
+   AQUA
+   LIGHT BLUE
+   BLUE
+   VIOLET
+   GREY
+   LIGHT GRAY
+   WHITE */
+
+			AiRcOS_Base->editor_cmap[0] = ObtainBestPenA(cm, 0x00<<24, 0x00<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[1] = ObtainBestPenA(cm, 0xff<<24, 0xff<<24, 0xff<<24, NULL);
+			AiRcOS_Base->editor_cmap[2] = ObtainBestPenA(cm, 0xff<<24, 0x00<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[3] = ObtainBestPenA(cm, 0x00<<24, 0x93<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[4] = ObtainBestPenA(cm, 0x00<<24, 0xff<<24, 0xff<<24, NULL);
+			AiRcOS_Base->editor_cmap[5] = ObtainBestPenA(cm, 0xff<<24, 0xff<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[6] = ObtainBestPenA(cm, 0x00<<24, 0x00<<24, 0x7f<<24, NULL);
+			AiRcOS_Base->editor_cmap[7] = ObtainBestPenA(cm, 0xff<<24, 0x00<<24, 0xff<<24, NULL);
+			AiRcOS_Base->editor_cmap[8] = ObtainBestPenA(cm, 0x00<<24, 0x00<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[9] = ObtainBestPenA(cm, 0xff<<24, 0xff<<24, 0xff<<24, NULL);
+			AiRcOS_Base->editor_cmap[10] = ObtainBestPenA(cm, 0xff<<24, 0x00<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[11] = ObtainBestPenA(cm, 0x00<<24, 0x93<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[12] = ObtainBestPenA(cm, 0x00<<24, 0xff<<24, 0xff<<24, NULL);
+			AiRcOS_Base->editor_cmap[13] = ObtainBestPenA(cm, 0xff<<24, 0xff<<24, 0x00<<24, NULL);
+			AiRcOS_Base->editor_cmap[14] = ObtainBestPenA(cm, 0x00<<24, 0x00<<24, 0x7f<<24, NULL);
+			AiRcOS_Base->editor_cmap[15] = ObtainBestPenA(cm, 0xff<<24, 0x00<<24, 0xff<<24, NULL);
+			AiRcOS_Base->editor_cmap[16] = ObtainBestPenA(cm, 0x00<<24, 0x00<<24, 0x7f<<24, NULL);
+			AiRcOS_Base->editor_cmap[17] = ObtainBestPenA(cm, 0xff<<24, 0x00<<24, 0xff<<24, NULL);
+			AiRcOS_Base->editor_cmap[18] = ObtainBestPenA(cm, 0xff<<24, 0xff<<24, 0xff<<24, NULL);
+			break;
+		}
+
+		case MUIM_Hide:
+		{
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_Hide\n"));
+				struct ColorMap *cm = muiRenderInfo(self)->mri_Screen->ViewPort.ColorMap;
+				int c;
+
+			for(c = 0; c < 8; c++)
+			{
+				if(AiRcOS_Base->editor_cmap[c] >= 0)
+				{
+					ReleasePen(cm, AiRcOS_Base->editor_cmap[c]);
+				}
+			}
+			break;
+		}
+
+		case MUIM_DragQuery:
+		{
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_DragQuery\n"));
+			return(TRUE);
+		}
+
+		case MUIM_DragDrop:
+		{
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_DragDrop\n"));
+#if 0
+			 struct MUIP_DragDrop *drop_msg = (struct MUIP_DragDrop *)message;
+			 ULONG active;
+
+			if(GetAttr(MUIA_List_Active, drop_msg->obj, &active))
+			{
+				DoMethod(obj, MUIM_TextEditor_InsertText, StdEntries[active]);
+			}
+			break;
+#endif
+		}
+
+      case MUIM_HandleEvent:
+      {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent\n"));
+         struct CustomTEInstData *data = INST_DATA(CLASS, self);
+         if ((!(data->cte_ChanPriv))&&(!(data->cte_ServPriv)))
+         {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Gadget not handled by us\n"));
+           break;
+         }
+
+         struct MUIP_HandleEvent *hevent_msg = (struct MUIP_HandleEvent *)message;
+         struct IntuiMessage *imsg = hevent_msg->imsg;
+         if (imsg->Class == IDCMP_RAWKEY)
+         {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: RAWKEY Code %d\n", imsg->Code));
+           if ((imsg->Code != 66)&&(data->partialNameToMatch))
+           {
+             ULONG cur_cursx = 0, cur_cursy = 0; 
+             get(self, MUIA_TextEditor_CursorX, &cur_cursx);
+             get(self, MUIA_TextEditor_CursorY, &cur_cursy);
+             if ((data->partMatchMaxX != cur_cursx)||(data->partMatchY != cur_cursy))
+             {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Freeing old name completion buffer\n"));
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: [ matchX %d != curX %d   ||   matchY %d != curY %d]\n", data->partMatchMaxX, cur_cursx, data->partMatchY, cur_cursy));
+               FreeVec(data->partialNameToMatch);
+               data->currentNameMatch = NULL;
+               data->partialNameToMatch = NULL;
+             }
+           }
+
+           if (imsg->Code == 66)
+           {
+             char *foundName = NULL;
+             struct Rectangle crsr_Ncomplete;
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: TAB Detected!\n"));
+             if (!(data->partialNameToMatch))
+             {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Start new name match\n"));
+               if (data->cte_ChanPriv)
+               {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Gadget has UserList - Try to perform name completion ..\n"));
+                 get(self, MUIA_TextEditor_CursorX, &crsr_Ncomplete.MaxX);
+                 get(self, MUIA_TextEditor_CursorY, &crsr_Ncomplete.MinY);
+
+                 if (crsr_Ncomplete.MaxX!=0)
+                 {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Valid cursor X offset\n"));
+                   char *inputGadBuffer = NULL;
+                   crsr_Ncomplete.MinX = 0;
+                   crsr_Ncomplete.MaxY = crsr_Ncomplete.MinY;
+
+                   inputGadBuffer = (APTR)DoMethod( self, MUIM_TextEditor_ExportText );
+
+                   int curline = 0, cur_pos=0;
+                   while (curline <= crsr_Ncomplete.MinY)
+                   {
+                     if (curline == crsr_Ncomplete.MinY)
+                       break;
+
+                     if (inputGadBuffer[cur_pos]=='\n')
+                     {
+                       curline++;
+                     }
+                     cur_pos++;
+                   }
+
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: cursor line (Y) @ starts at pos %d\n", cur_pos));
+
+					    int start_char = 0;                   
+                   for (start_char = 0; start_char < crsr_Ncomplete.MaxX; start_char++)
+                   {
+                     if (inputGadBuffer[((cur_pos + crsr_Ncomplete.MaxX) - start_char)]==' ')
+                     {
+                       if (start_char != 0)
+                       start_char = start_char -1;
+                       break;
+                     }
+                   }
+                   start_char = crsr_Ncomplete.MaxX - start_char;
+
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: partname starts @ %d, ends at %d\n", start_char, crsr_Ncomplete.MaxX));
+
+                   if ((crsr_Ncomplete.MaxX - start_char) > 0)
+                   {
+                     if (data->partialNameToMatch = AllocVec(crsr_Ncomplete.MaxX - start_char, MEMF_CLEAR|MEMF_PUBLIC))
+                     {
+                       CopyMem(inputGadBuffer + cur_pos + start_char, data->partialNameToMatch, crsr_Ncomplete.MaxX - start_char);
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Attempt to match partialname '%s'\n", data->partialNameToMatch));
+                       struct IRC_Channel_Group_SubGroup *current_Group=NULL;
+                       struct IRC_Channel_Group_User *current_User=NULL;
+                       ForeachNode(&data->cte_ChanPriv->chan_usergroup, current_Group)
+                       {
+                         ForeachNode(&current_Group->group_usergroup, current_User)
+                         {
+                           if (strncasecmp(current_User->user_name, data->partialNameToMatch, strlen(data->partialNameToMatch))==0)
+                           {
+                             foundName = current_User->user_name;
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Possible Match found ...  '%s'\n", foundName));
+                             goto possiblefound;
+                           }
+                         }
+                       }
+possiblefound:         if (foundName)
+                       {
+                         data->partMatchY = crsr_Ncomplete.MinY;
+                         data->partMatchMinX = start_char;
+                         data->partMatchMaxX = crsr_Ncomplete.MaxX;
+                       }
+                     }
+                   }
+                   FreeVec(inputGadBuffer);
+                 }                
+               }
+             }
+             else
+             {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Already Active match for '%s'!\n", data->partialNameToMatch));
+               BOOL FoundCurrentMatch = FALSE;
+               struct IRC_Channel_Group_SubGroup *current_Group=NULL;
+               struct IRC_Channel_Group_User *current_User=NULL;
+
+               ForeachNode(&data->cte_ChanPriv->chan_usergroup, current_Group)
+               {
+                 ForeachNode(&current_Group->group_usergroup, current_User)
+                 {
+                   if (FoundCurrentMatch)
+                   {
+                     if (strncasecmp(current_User->user_name, data->partialNameToMatch, strlen(data->partialNameToMatch))==0)
+                     {
+                       foundName = current_User->user_name;
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Next Possible Match found ...  '%s'\n", foundName));
+                       goto possnextmatched;
+                     }
+                   }
+                   else
+                   {
+                     if (strcasecmp(current_User->user_name, data->currentNameMatch)==0)
+                     {
+                       FoundCurrentMatch = TRUE;
+                     }
+                   }
+                 }
+               }
+possnextmatched:
+             ;
+             }
+
+             if (foundName)
+             {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Inserting matched name in input gadget ..\n"));
+               crsr_Ncomplete.MinX = data->partMatchMinX;
+               crsr_Ncomplete.MinY = data->partMatchY;
+
+               if (data->currentNameMatch)
+               {
+                 crsr_Ncomplete.MaxX = data->partMatchMinX + strlen(data->currentNameMatch);
+               }
+               else
+               {
+                 crsr_Ncomplete.MaxX = data->partMatchMaxX;
+               }
+               data->partMatchMaxX = crsr_Ncomplete.MaxX;
+
+               crsr_Ncomplete.MaxY = data->partMatchY;
+               data->currentNameMatch = foundName;
+
+               set(self, MUIA_TextEditor_Quiet, TRUE);
+               DoMethod(self, MUIM_TextEditor_MarkText,
+                                    crsr_Ncomplete.MinX, crsr_Ncomplete.MinY,
+                                    crsr_Ncomplete.MaxX, crsr_Ncomplete.MaxY);
+
+               DoMethod(self, MUIM_TextEditor_Replace, data->currentNameMatch, 0);
+
+               crsr_Ncomplete.MaxX = crsr_Ncomplete.MinX + strlen(data->currentNameMatch);
+               data->partMatchMaxX = crsr_Ncomplete.MaxX;
+
+               DoMethod(self, MUIM_TextEditor_MarkText,
+                                      crsr_Ncomplete.MaxX, crsr_Ncomplete.MaxY,
+                                      crsr_Ncomplete.MaxX, crsr_Ncomplete.MaxY);
+               set(self, MUIA_TextEditor_Quiet, FALSE);
+
+               set(self, MUIA_TextEditor_CursorX, crsr_Ncomplete.MaxX);
+               set(self, MUIA_TextEditor_CursorY, crsr_Ncomplete.MaxY);
+             }
+             else
+             {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: No Match Found\n"));             
+             }
+
+             return(MUI_EventHandlerRC_Eat);
+           } else if (imsg->Code == 68) {
+             if(imsg->Qualifier & (IEQUALIFIER_LSHIFT | IEQUALIFIER_RSHIFT))
+             {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Shift + Enter Detected!\n"));
+               // Treat as a standard <ENTER> - and let the superclass deal with it
+               imsg->Qualifier &= ~(IEQUALIFIER_LSHIFT | IEQUALIFIER_RSHIFT);
+               break;
+             }
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Enter Detected!\n"));
+             // Cause a send for this object instead
+             if (data->cte_ChanPriv)
+             {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Causing Channel Send ..\n"));
+               DoMethod(data->cte_ChanPriv->chan_send, MUIM_Set, MUIA_Pressed, TRUE);
+               DoMethod(data->cte_ChanPriv->chan_send, MUIM_Set, MUIA_Pressed, FALSE);
+             } else if (data->cte_ServPriv) {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Causing Server Send ..\n"));
+               DoMethod(data->cte_ServPriv->serv_send, MUIM_Set, MUIA_Pressed, TRUE);
+               DoMethod(data->cte_ServPriv->serv_send, MUIM_Set, MUIA_Pressed, FALSE);
+             }             
+             return(MUI_EventHandlerRC_Eat);
+           } else if ((imsg->Code == 0x4c)||(imsg->Code == 0x3e)) {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Curs Up Detected!\n"));
+             return(MUI_EventHandlerRC_Eat);
+           } else if ((imsg->Code == 0x4d)||(imsg->Code == 0x1e)) {
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleEvent: Curs Down Detected!\n"));
+             return(MUI_EventHandlerRC_Eat);
+           }
+         }
+			break;
+		}
+
+		case MUIM_TextEditor_HandleError:
+		{
+				char *errortxt = NULL;
+D(bug("[AiRcOS] TextEditor_Dispatcher: MUIM_TextEditor_HandleError\n"));
+			switch((( struct MUIP_TextEditor_HandleError *)message)->errorcode)
+			{
+				case Error_ClipboardIsEmpty:
+					errortxt = "\33cThe clipboard is empty.";
+					break;
+				case Error_ClipboardIsNotFTXT:
+					errortxt = "\33cThe clipboard does not contain text.";
+					break;
+				case Error_MacroBufferIsFull:
+					break;
+				case Error_MemoryAllocationFailed:
+					break;
+				case Error_NoAreaMarked:
+					errortxt = "\33cNo area marked.";
+					break;
+				case Error_NoMacroDefined:
+					break;
+				case Error_NothingToRedo:
+					errortxt = "\33cNothing to redo.";
+					break;
+				case Error_NothingToUndo:
+					errortxt = "\33cNothing to undo.";
+					break;
+				case Error_NotEnoughUndoMem:
+					errortxt = "There is not enough memory\nto keep the undo buffer.\n\nThe undobuffer is lost.";
+					break;
+				case Error_StringNotFound:
+					break;
+				case Error_NoBookmarkInstalled:
+					errortxt = "There is no bookmark installed!";
+					break;
+				case Error_BookmarkHasBeenLost:
+					errortxt = "Your bookmark has unfortunately been lost.";
+					break;
+			}
+			if(errortxt)
+			{
+D(bug("[AiRcOS] TextEditor:Error %s\n", errortxt));
+//				MUI_Request(app, window, 0L, NULL, "Continue", errortxt);
+			}
+			break;
+		}
+	}
+  return(DoSuperMethodA(CLASS, self, message));
+
+}
+BOOPSI_DISPATCHER_END
+
+int aircosApp_sendline(struct IRC_Connection_Private *forConnection)
+{
+    int count;
+
+    forConnection->connection_buff_send = FormatToSend(forConnection->connection_buff_send);
+
+    if ((count = send(forConnection->connection_socket, forConnection->connection_buff_send,
+        strlen(forConnection->connection_buff_send),0)) < 0)
+    {
+        return -1;
+    }
+    return count;
+}
+
+struct IRC_Channel_Priv  *FindNamedChannel( struct IRC_Connection_Private *onThisConnection, char *findThisChan)
+{
+   struct IRC_Channel_Priv  *foundChannel = NULL;
+D(bug("[AiRcOS] FindNamedChannel('%s' on '%s')\n", findThisChan, onThisConnection->connection_server));
+
+   ForeachNode(&onThisConnection->connected_server->serv_chans, foundChannel)
+   {
+D(bug("[AiRcOS](FindNamedChannel) Checking against record for '%s'\n",foundChannel->chan_name));
+      if (strcasecmp(foundChannel->chan_name,findThisChan)==0) return foundChannel;
+   }
+   return NULL;
+}
+
+void aircosApp_showChanOutput(struct IRC_Channel_Priv *thisChanPriv, struct serv_Outline *sa)
+{
+  if ( thisChanPriv->chan_displayedlines >= CHANOUT_MAXLINES)
+  {
+D(bug("[AiRcOS](showChanOutput) Freeing text at head of output ... \n"));
+  }
+
+// if (aircos_PrefsStruct->prefs_LogDir)
+// {
+//     Output Current line to log file for this channel... 
+// }
+
+  //And finally output the line ...
+  struct Rectangle crsr_output;
+
+  set(thisChanPriv->chan_output, MUIA_TextEditor_Quiet, TRUE);  
+  if (thisChanPriv->chan_currentpen != 0)
+  {
+    get(thisChanPriv->chan_output, MUIA_TextEditor_CursorX, &crsr_output.MinX);
+    get(thisChanPriv->chan_output, MUIA_TextEditor_CursorY, &crsr_output.MinY);
+  }
+  
+  sa->so_name = FormatToDisplay(sa->so_name);
+  DoMethod( thisChanPriv->chan_output, MUIM_TextEditor_InsertText, sa->so_name, MUIV_TextEditor_InsertText_Bottom );
+
+  if (thisChanPriv->chan_currentpen != 0)
+  {
+    get(thisChanPriv->chan_output, MUIA_TextEditor_CursorX, &crsr_output.MaxX);
+    get(thisChanPriv->chan_output, MUIA_TextEditor_CursorY, &crsr_output.MaxY);
+    DoMethod(thisChanPriv->chan_output, MUIM_TextEditor_MarkText,
+                                      crsr_output.MinX, crsr_output.MinY,
+                                      crsr_output.MaxX, crsr_output.MaxY);
+
+    DoMethod(thisChanPriv->chan_output, MUIM_Set, MUIA_TextEditor_Pen, thisChanPriv->chan_currentpen);
+
+    DoMethod(thisChanPriv->chan_output, MUIM_TextEditor_MarkText,
+                                      crsr_output.MaxX, crsr_output.MaxY,
+                                      crsr_output.MaxX, crsr_output.MaxY);
+    set(thisChanPriv->chan_output, MUIA_TextEditor_CursorX, crsr_output.MaxX);
+    set(thisChanPriv->chan_output, MUIA_TextEditor_CursorY, crsr_output.MaxY);
+  }
+  set(thisChanPriv->chan_output, MUIA_TextEditor_Quiet, FALSE);
+  thisChanPriv->chan_displayedlines++;
+}
+
+void aircosApp_setChanPen(struct IRC_Channel_Priv *thisChanPriv, ULONG pen)
+{
+  thisChanPriv->chan_currentpen = pen;
+}
+
+/****/
+
+int aircosApp_RegisterFunction(char *functionName, void *functionRcvCall, int functionRcvCallArgCnt, void *functionSendCall, int functionSendCallArgCnt)
+{
+D(bug("[AiRcOS] aircosApp_RegisterFunction(%s)\n", functionName));
+
+  struct intern_functionrecord *newRecord = AllocVec(sizeof(struct intern_functionrecord),MEMF_CLEAR);
+  newRecord->ifr_command.command = functionName;
+  newRecord->ifr_command.command_doFunction = functionRcvCall;
+  newRecord->ifr_command.servArgCount = functionRcvCallArgCnt;
+  newRecord->ifr_command.command_clientFunction = functionSendCall;
+  newRecord->ifr_command.clientArgCount = functionSendCallArgCnt;
+  AddTail(&AiRcOS_Base->funcs_FunctionList, &newRecord->ifr_Node);
+
+  return 1;
+}
+
+APTR aircosApp_FindFunction(char * functionName)
+{
+D(bug("[AiRcOS] aircosApp_FindFunction(%s)\n", functionName));
+  struct intern_functionrecord *foundFunction = NULL;
+
+  ForeachNode(&AiRcOS_Base->funcs_FunctionList, foundFunction)
+  {
+D(bug("[AiRcOS](aircosApp_FindFunction) Checking against record for '%s'\n",foundFunction->ifr_command.command));
+    if (strcasecmp(foundFunction->ifr_command.command, functionName)==0) return &foundFunction->ifr_command;
+  }
+  return NULL;
+}
+
+int aircosApp_RemoveFunction(char * functionName)
+{
+D(bug("[AiRcOS] aircosApp_RemoveFunction(%s)\n", functionName));
+
+  return 1;
+}
+
+int aircosApp_RegisterAction(char *actionName, void *actionRcvCall, int actionRcvCallArgCnt, void *actionSendCall, int actionSendCallArgCnt)
+{
+D(bug("[AiRcOS] aircosApp_RegisterAction(%s)\n", actionName));
+
+  struct intern_functionrecord *newRecord = AllocVec(sizeof(struct intern_functionrecord),MEMF_CLEAR);
+  newRecord->ifr_command.command = actionName;
+  newRecord->ifr_command.command_doFunction = actionRcvCall;
+  newRecord->ifr_command.servArgCount = actionRcvCallArgCnt;
+  newRecord->ifr_command.command_clientFunction = actionSendCall;
+  newRecord->ifr_command.clientArgCount = actionSendCallArgCnt;
+  AddTail(&AiRcOS_Base->funcs_FunctionList, &newRecord->ifr_Node);
+
+  return 1;
+}
+
+APTR aircosApp_FindAction(char * actionName)
+{
+D(bug("[AiRcOS] aircosApp_FindAction(%s)\n", actionName));
+  struct intern_functionrecord *foundAction = NULL;
+
+  ForeachNode(&AiRcOS_Base->funcs_ActionList, foundAction)
+  {
+D(bug("[AiRcOS](aircosApp_FindAction) Checking against record for '%s'\n",foundAction->ifr_command.command));
+    if (strcasecmp(foundAction->ifr_command.command, actionName)==0) return &foundAction->ifr_command;
+  }
+  return NULL;
+}
+
+int aircosApp_RemoveAction(char * actionName)
+{
+D(bug("[AiRcOS] aircosApp_RemoveAction(%s)\n", actionName));
+
+  return 1;
+}
+
+int aircosApp_serverconnect(struct IRC_Connection_Private *makeThisConnection)
+{
+D(bug("[AiRcOS] serverconnect(%s)\n",makeThisConnection->connection_server));
+
+    struct sockaddr_in sa;
+    struct hostent *hp=NULL;
+//    int t=0;
+
+    if (!(SocketBase))
+    {
+        if (!(aircosApp__OpenBSDSOCKET()))
+        {
+D(bug("[AiRcOS](serverconnect) No BSDSOCKET library!\n"));
+        return -1;
+        }
+    }
+
+    if (!(makeThisConnection->connection_buff_send))
+    {
+        if(!(makeThisConnection->connection_buff_send = AllocVec(AIRCOS_MAXSERVERRESPONSE,MEMF_CLEAR)))
+        {
+D(bug("[AiRcOS](serverconnect) Failed to allocate transmit buffer!\n"));
+        return -1;
+        }
+    }
+    if (!(makeThisConnection->connection_buff_receive))
+    {
+        if(!(makeThisConnection->connection_buff_receive = AllocVec(AIRCOS_MAXSERVERRESPONSE,MEMF_CLEAR)))
+        {
+D(bug("[AiRcOS](serverconnect) Failed to allocate receive buffer!\n"));
+        FreeVec(makeThisConnection->connection_buff_send);
+        makeThisConnection->connection_buff_send = NULL;
+        return -1;
+        }
+    }
+
+    if ((hp = gethostbyname(makeThisConnection->connection_server)) == NULL) return -1;
+
+D(bug("[AiRcOS](serverconnect) found hostname record for '%s'\n",hp->h_name));
+
+// TODO: hostent record seems malformed?"
+//    for (t = 0, makeThisConnection->connection_socket = -1; makeThisConnection->connection_socket < 0 && hp->h_addr_list[t] != NULL; t++)
+// {
+        memset(&sa, 0L, sizeof(struct sockaddr_in));
+        CopyMem(hp->h_addr,(char *)&sa.sin_addr,hp->h_length);
+        sa.sin_family = hp->h_addrtype;
+        sa.sin_port = htons((unsigned short) makeThisConnection->connection_port);
+
+D(bug("[AiRcOS](serverconnect) Attempting to connect to hostentry record %d\n",t));
+
+        makeThisConnection->connection_socket = socket(hp->h_addrtype, SOCK_STREAM, 0);
+D(bug("[AiRcOS](serverconnect) Return from socket()=%d\n",makeThisConnection->connection_socket));
+
+        if (makeThisConnection->connection_socket >= 0)
+        {
+D(bug("[AiRcOS](serverconnect) socket created ..\n"));
+            if (connect(makeThisConnection->connection_socket, (struct sockaddr *) &sa, sizeof(struct sockaddr_in)) < 0)
+            {
+                CloseSocket(makeThisConnection->connection_socket);
+                makeThisConnection->connection_socket = -1;
+D(bug("[AiRcOS](serverconnect) socket connect failed\n"));
+            }
+            else
+            {
+D(bug("[AiRcOS](serverconnect) socket lvl connection established\n[AiRcOS](serverconnect) Attempting login ..\n"));
+
+                sprintf(makeThisConnection->connection_buff_send, "USER %s * * :The POWER of AROS!\n",
+                    makeThisConnection->connection_user);
+                aircosApp_sendline(makeThisConnection);
+D(bug("[AiRcOS](serverconnect) Sent USER NAME ..\n"));
+                if (makeThisConnection->connection_pass[0] != 0)
+                {
+                    sprintf(makeThisConnection->connection_buff_send, "PASS :%s\n", makeThisConnection->connection_pass);
+                    aircosApp_sendline(makeThisConnection);
+D(bug("[AiRcOS](serverconnect) Sent PASSWORD ..\n"));
+                }
+
+                sprintf(makeThisConnection->connection_buff_send, "NICK :%s\n", makeThisConnection->connection_nick);
+                aircosApp_sendline(makeThisConnection);
+D(bug("[AiRcOS](serverconnect) Sent NICK ..\n"));
+            }
+        }
+
+        if (makeThisConnection->connection_socket == -1)
+        {
+D(bug("[AiRcOS](serverconnect) create socket failed\n"));
+            switch (errno)
+            {
+            case EINVAL:
+            case EPROTONOSUPPORT:
+D(bug("[AiRcOS](serverconnect)   socket() : SOCK_STREAM unsupported on this domain.\n"));
+                break;
+
+            case ENFILE:
+D(bug("[AiRcOS](serverconnect)   socket() : no free sockets to allocate.\n"));
+                break;
+
+            case EMFILE:
+D(bug("[AiRcOS](serverconnect)   socket() : process table overflow while requesting socket.\n"));
+                break;
+
+            case EACCES:
+D(bug("[AiRcOS](serverconnect)   socket() : Permission denied creating socket.\n"));
+                break;
+
+            case ENOMEM:
+D(bug("[AiRcOS](serverconnect)   socket() : Not enough free mem to allocate socket.\n"));
+                break;
+
+            default:
+D(bug("[AiRcOS](serverconnect)   socket() : Unknown error allocating socket\n"));
+                break;
+            }
+
+            FreeVec(makeThisConnection->connection_buff_send);
+            makeThisConnection->connection_buff_send = NULL;
+            FreeVec(makeThisConnection->connection_buff_receive);
+            makeThisConnection->connection_buff_receive = NULL;
+        }
+// }
+
+    return makeThisConnection->connection_socket;
+}
+
+int aircosApp_processServerData(struct IRC_Connection_Private	*process_thisConnection, char *serverin_buffer)
+{
+    int pos, found = 0;
+D(bug("[AiRcOS] processserverdata('%s')\n", serverin_buffer));
+D(bug("[AiRcOS](processserverdata) Connected Nick '%s'\n", process_thisConnection->connection_nick));
+
+    if((AiRcOS_Base->Ai_tmp=strstr(serverin_buffer, "PING :")))
+    {
+D(bug("[AiRcOS](processserverdata) Quick Reply to PING ..\n"));
+        strncpy(process_thisConnection->connection_buff_send,AiRcOS_Base->Ai_tmp, 512);
+        process_thisConnection->connection_buff_send[510] = '\0';
+        process_thisConnection->connection_buff_send[1] = 'O'; /* Change pIng to pOng */
+        strcat(process_thisConnection->connection_buff_send, "\n");
+        return aircosApp_sendline(process_thisConnection);
+    }
+
+    if (process_thisConnection->connection_unprocessed) FreeVec(process_thisConnection->connection_unprocessed);
+    process_thisConnection->connection_unprocessed = AllocVec(strlen(serverin_buffer) +1,MEMF_CLEAR);
+    strcpy( process_thisConnection->connection_unprocessed, serverin_buffer );
+    
+    pos = 0;
+    process_thisConnection->connection_serv_ARGS[pos] = serverin_buffer;
+    if (*(process_thisConnection->connection_serv_ARGS[pos]) == ':')
+        process_thisConnection->connection_serv_ARGS[pos]++;
+
+    /* Separate the server string into args .. */
+    while (process_thisConnection->connection_serv_ARGS[pos] != NULL && pos < (MAX_SERVER_ARGS-1))
+        {
+            if (*(process_thisConnection->connection_serv_ARGS[pos]) == ':') break;
+            else
+            {
+            if ((AiRcOS_Base->Ai_tmp = strchr(process_thisConnection->connection_serv_ARGS[pos], ' ')))
+            {
+                    process_thisConnection->connection_serv_ARGS[++pos] = &AiRcOS_Base->Ai_tmp[1];
+                    *AiRcOS_Base->Ai_tmp = '\0';
+            }
+                else process_thisConnection->connection_serv_ARGS[++pos] = NULL;
+            }
+        }
+
+#if defined(DEBUG)
+D(bug("[AiRcOS](processserverdata) ARGS :"));
+    int debug_args_count;
+        for (debug_args_count = 0; debug_args_count <= pos ; debug_args_count++)
+        {
+D(bug(" %d:'%s'",debug_args_count,process_thisConnection->connection_serv_ARGS[debug_args_count]));
+        }
+D(bug("\n"));
+#endif
+
+    if (process_thisConnection->connection_serv_ARGS[pos] != NULL
+        && *(process_thisConnection->connection_serv_ARGS[pos]) == ':')
+        process_thisConnection->connection_serv_ARGS[pos]++;
+    
+    process_thisConnection->connection_serv_ARGS[++pos] = NULL;
+    
+    if ((AiRcOS_Base->Ai_tmp = strchr(process_thisConnection->connection_serv_ARGS[0], '!')))
+    {
+            *AiRcOS_Base->Ai_tmp = '\0';
+    }
+    
+// CHECKME: added NULL check for connection_serv_ARGS[1]"
+    if (process_thisConnection->connection_serv_ARGS[1] && (pos = atoi(process_thisConnection->connection_serv_ARGS[1])))
+    {
+D(bug("[AiRcOS](processserverdata) Calling IRC DoNumeric funtion for %d\n", pos));
+        pos = aircos_IRC_donumeric(process_thisConnection, pos);
+    }
+// CHECKME: added NULL check for connection_serv_ARGS[1]"
+    else if (process_thisConnection->connection_serv_ARGS[1])
+    {
+D(bug("[AiRcOS](processserverdata) Text Command received '%s'\n",process_thisConnection->connection_serv_ARGS[1]));
+            for (pos = 0; commandList_array[pos].command!=NULL && !found; pos++) found =
+               (strcasecmp(commandList_array[pos].command, process_thisConnection->connection_serv_ARGS[1]) == 0);
+    
+            if (found)
+            {
+D(bug("[AiRcOS](processserverdata) Calling IRC function %d\n", pos-1));
+                pos = (*commandList_array[pos-1].command_doFunction)(process_thisConnection);
+            }
+            else
+            {
+D(bug("[AiRcOS](processserverdata) Calling IRC NOP function\n"));
+                pos = aircos_IRC_nop(process_thisConnection);
+            }
+    }
+D(bug("[AiRcOS](processserverdata) Returned from IRC function\n"));
+    
+// CHECKME: added NULL check for connection_serv_ARGS[1]"
+    if (process_thisConnection->connection_serv_ARGS[1] && strncmp(process_thisConnection->connection_serv_ARGS[1], "Closing", 7) == 0)
+    {
+    return (AiRcOS_Base->Ai_reconnect = 0);
+    }
+
+    return 1;
+}
+
+AROS_UFH3(void, serverconnect_func,
+   AROS_UFHA(struct Hook *, unused_hook, A0),
+   AROS_UFHA(APTR, obj, A2),
+   AROS_UFHA(struct IRC_Channel_Priv  *, hook_channel_arg, A1 ))
+{
+  AROS_USERFUNC_INIT
+
+D(bug("[AiRcOS] serverconnect_func()\n"));
+
+  struct IRC_Connection_Private	*dtest_connection = NULL;
+  char  *join_channel = NULL;
+
+    if (!(dtest_connection = AllocVec(sizeof(struct IRC_Connection_Private),MEMF_CLEAR)))
+    {
+D(bug("[AiRcOS](serverconnect_func) Failed to allocate connection record!!\n"));
+        return;
+    }
+
+   if (!(aircos_Prefs_ServerActive))
+   {
+    /* CONNECT USING QUICK CONNECT */
+D(bug("[AiRcOS](serverconnect_func) Using Quick Connect\n"));
+     set(AiRcOS_Base->butt_connectServer, MUIA_Disabled, TRUE);
+
+     IPTR  temp_servport=0;
+
+     char *str_connect_nick = NULL;
+
+     get( AiRcOS_Base->quickcon_servadd, MUIA_String_Contents, &dtest_connection->connection_server);
+     get( AiRcOS_Base->quickcon_servport, MUIA_String_Integer, &temp_servport);
+     get( AiRcOS_Base->quickcon_servuser, MUIA_String_Contents, &dtest_connection->connection_user);
+     get( AiRcOS_Base->quickcon_servpass, MUIA_String_Contents, &dtest_connection->connection_pass);
+
+     get( AiRcOS_Base->quickcon_nick, MUIA_String_Contents, &str_connect_nick);
+     if (!(dtest_connection->connection_nick = (char *)AllocVec(strlen(str_connect_nick)+1,MEMF_CLEAR)))
+     {
+D(bug("[AiRcOS](serverconnect_func) Failed to allocate nick buffer!!.\n"));
+       set(AiRcOS_Base->butt_connectServer, MUIA_Disabled, FALSE);
+       return;
+     }
+
+     strcpy(dtest_connection->connection_nick, str_connect_nick);
+
+     get( AiRcOS_Base->quickcon_channel, MUIA_String_Contents, &join_channel);
+
+     dtest_connection->connection_port = (UWORD)temp_servport;
+D(bug("[AiRcOS](serverconnect_func) Attempting to connect to %s:%d, as %s\n", dtest_connection->connection_server, temp_servport, dtest_connection->connection_user));
+
+D(bug("[AiRcOS](serverconnect_func) Port : %d, Nick %s\n", dtest_connection->connection_port,dtest_connection->connection_nick));
+
+    } else {
+    /* CONNECT USING AN EXISTING PREFS RECORD */
+D(bug("[AiRcOS](serverconnect_func) Using Prefs Connection.\n"));
+      dtest_connection->connection_server = aircos_Prefs_ServerActive->asn_Server;
+      dtest_connection->connection_port = aircos_Prefs_ServerActive->asn_Port;
+
+      dtest_connection->connection_user = aircos_Prefs_DefUser;
+      if (!(dtest_connection->connection_nick = (char *)AllocVec(strlen(aircos_Prefs_DefNick)+1,MEMF_CLEAR)))
+      {
+D(bug("[AiRcOS](serverconnect_func) Failed to allocate nick buffer!!.\n"));
+        return;
+      }
+      strcpy(dtest_connection->connection_nick, aircos_Prefs_DefNick);   
+      join_channel = "#AROS";
+    }
+
+    int test_socket = aircosApp_serverconnect(dtest_connection);
+
+    if (test_socket >= 0)
+    {
+        struct IRC_Server_Priv  *connected_server = NULL;
+      
+        if (!(connected_server = aircos_add_server(dtest_connection->connection_server)))
+        {
+D(bug("[AiRcOS](serverconnect_func) Failed to create connection page!!.\n"));
+            set(AiRcOS_Base->butt_connectServer, MUIA_Disabled, FALSE);
+            return;
+        }
+
+        connected_server->serv_connection = dtest_connection;
+        dtest_connection->connected_server = connected_server;
+
+        set(AiRcOS_Base->butt_connectServer, MUIA_Disabled, FALSE);
+        set(AiRcOS_Base->aircos_quickconnectwin, MUIA_Window_Open, FALSE);
+      
+D(bug("[AiRcOS](serverconnect_func) Socket connection successful\n"));
+        if (join_channel[0] != 0)
+        {
+D(bug("[AiRcOS](serverconnect_func) Attempting to join channel %s ..\n", join_channel));
+
+            sprintf(dtest_connection->connection_buff_send, "JOIN %s\n", join_channel);
+            aircosApp_sendline(dtest_connection);
+        }
+    }
+    else
+    {
+D(bug("[AiRcOS](serverconnect_func) Socket connection failed\n"));
+        if (dtest_connection->connection_buff_send)
+        {
+            FreeVec(dtest_connection->connection_buff_send);
+            dtest_connection->connection_buff_send = NULL;
+        }
+    
+        if (dtest_connection->connection_buff_receive)
+        {
+            FreeVec(dtest_connection->connection_buff_receive);
+            dtest_connection->connection_buff_receive = NULL;
+        }
+        FreeVec(dtest_connection);
+        dtest_connection = NULL;
+        set(AiRcOS_Base->butt_connectServer, MUIA_Disabled, FALSE);
+    }
+
+    if (dtest_connection)
+    {
+        AddTail((struct List *)&AiRcOS_Base->aircos_looseconnectionlist, (struct Node *) &dtest_connection->connection_node);
+    }
+// AiRcOS_Base->temp_process_thisConnection = dtest_connection;
+    set(AiRcOS_Base->butt_connectServer, MUIA_Disabled, FALSE);
+
+    AROS_USERFUNC_EXIT
+};
+
+void aircosApp_closeConnection(struct IRC_Connection_Private	*close_thisConnection)
+{
+    CloseSocket(close_thisConnection->connection_socket);
+
+    if (close_thisConnection->connection_buff_send)
+    {
+        FreeVec(close_thisConnection->connection_buff_send);
+        close_thisConnection->connection_buff_send = NULL;
+    }
+    
+    if (close_thisConnection->connection_buff_receive)
+    {
+        FreeVec(close_thisConnection->connection_buff_receive);
+        close_thisConnection->connection_buff_receive = NULL;
+    }
+    
+    FreeVec(close_thisConnection);
+    close_thisConnection = NULL;
+}
+
+void  aircosApp_MainProcessLoop()
+{
+    ULONG sigs = 0;
+
+D(bug("[AiRcOS] aircosApp_MainProcessLoop()\n"));
+    while (DoMethod(AiRcOS_Base->aircos_app, MUIM_Application_NewInput, (IPTR) &sigs) != MUIV_Application_ReturnID_Quit)
+    {
+        if (sigs)
+        {
+            ULONG mask = sigs | SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D | (1<<AiRcOS_Base->Ai_sigbit_ProcessStack);
+            int sel_sock, connection_Count = 0, highest_socket = 0;
+            struct IRC_Connection_Private	*process_thisConnection = NULL;
+
+            FD_ZERO(&AiRcOS_Base->Ai_readfs);
+            ForeachNode(&AiRcOS_Base->aircos_looseconnectionlist, process_thisConnection)
+            {
+               FD_SET(process_thisConnection->connection_socket, &AiRcOS_Base->Ai_readfs);
+               if (process_thisConnection->connection_socket > highest_socket)
+                   highest_socket = process_thisConnection->connection_socket;
+               connection_Count++;
+            }
+
+            if (connection_Count > 0)
+            {
+                //D(bug("[AiRcOS](MPL) Use WaitSelect ..\n"));
+                sel_sock = WaitSelect(highest_socket+1, &AiRcOS_Base->Ai_readfs, NULL, NULL, NULL, &mask);
+                if (sel_sock > 0)
+                {
+                    ForeachNode(&AiRcOS_Base->aircos_looseconnectionlist, process_thisConnection)
+                    {
+                        if (FD_ISSET(process_thisConnection->connection_socket, &AiRcOS_Base->Ai_readfs))
+                        {
+                            //D(bug("[AiRcOS](MPL) Received signal from stack ..\n"));
+                            char *tmpbuff = NULL,*tmpunprocbuff=NULL;
+                            UWORD tmpbuff_currpos=0;
+                            int count, i;
+                            BOOL processed = FALSE;
+
+                            if(process_thisConnection->connection_rawdata)
+                            {
+                             CopyMem(process_thisConnection->connection_rawdata,
+                                process_thisConnection->connection_buff_receive,
+                                process_thisConnection->connection_rawdata_length);
+                            }
+                            if ((count =
+                            recv(process_thisConnection->connection_socket,(process_thisConnection->connection_buff_receive) +
+                            process_thisConnection->connection_rawdata_length , AIRCOS_MAXSERVERRESPONSE -
+                            process_thisConnection->connection_rawdata_length,0)) > 0)
+                            {
+                                if(process_thisConnection->connection_rawdata)
+                                {
+                                    FreeVec(process_thisConnection->connection_rawdata);
+                                    process_thisConnection->connection_rawdata = NULL;
+                                    process_thisConnection->connection_rawdata_length = 0;
+                                }
+
+                                if ((tmpbuff = AllocVec(count,MEMF_CLEAR)))
+                                {
+D(bug("[AiRcOS](MPL) Processing server output (%d bytes)\n", count));
+                                    for (i = 0; i < count; i++)
+                                    {
+                                        if (process_thisConnection->connection_buff_receive[i] == '\n')
+                                        {
+D(bug("\n[AiRcOS](MPL) Process server line (%d bytes)\n"));
+                                            tmpbuff[tmpbuff_currpos] = '\0';
+                                            processed = TRUE;
+                                            if (!aircosApp_processServerData(process_thisConnection, tmpbuff))
+                                            {
+D(bug("[AiRcOS](MPL) Response End/Error?\n"));
+                                                // return 0;
+                                            }
+D(bug("[AiRcOS](MPL)         '%s'\n",tmpbuff));
+                                            tmpbuff_currpos=0;
+                                            tmpunprocbuff=NULL;
+                                        }
+                                        else if (process_thisConnection->connection_buff_receive[i] != '\r')
+                                        {
+D(bug("."));
+                                            tmpbuff[tmpbuff_currpos++] = process_thisConnection->connection_buff_receive[i];
+                                        }
+                                        else 
+                                        {
+D(bug("[AiRcOS](MPL) Response = r after %d bytes\n", i));
+                                            // return 1;
+                                            if ((count - i) > 1)
+                                            {
+                                                if (tmpunprocbuff==NULL)
+                                                {
+                                                    tmpunprocbuff=&process_thisConnection->connection_buff_receive[i]+1;
+                                                    processed = FALSE;
+                                                }
+                                            }
+                                        }
+                                    }
+D(bug("[AiRcOS](MPL) Server output done\n"));
+                                    if (!(processed))
+                                    {
+D(bug("[AiRcOS](MPL) unprocessed data remains ..\n"));
+                                        if (tmpunprocbuff)
+                                        {
+D(bug("[AiRcOS](MPL) storing unproccessed buffer info ..\n"));
+                                            process_thisConnection->connection_rawdata_length = (IPTR)&process_thisConnection->connection_buff_receive[count] - (IPTR)tmpunprocbuff;
+                                            process_thisConnection->connection_rawdata = AllocVec(process_thisConnection->connection_rawdata_length, MEMF_CLEAR);
+                                            CopyMem(tmpunprocbuff, process_thisConnection->connection_rawdata, process_thisConnection->connection_rawdata_length);
+                                        }
+                                    }
+                                    else
+                                    {
+D(bug("[AiRcOS](MPL) data processed completely ..\n"));
+                                        if (process_thisConnection->connection_rawdata)
+                                        {
+D(bug("[AiRcOS](MPL) freeing unproccessed buffer\n"));
+                                          FreeVec(process_thisConnection->connection_rawdata);
+                                        }
+                                        process_thisConnection->connection_rawdata = NULL;
+                                        process_thisConnection->connection_rawdata_length = 0;
+                                    }
+												FreeVec(tmpbuff);
+D(bug("[AiRcOS](MPL) output processing complete\n"));
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (sel_sock < 0)
+                {
+                    D(bug("[AiRcOS](MPL) Signal ERROR from stack ..\n"));
+                }
+            }
+            else
+            {
+                //D(bug("[AiRcOS](MPL) Use standard Wait ..\n"));
+                mask = Wait(mask);
+            }
+
+            if (mask & SIGBREAKF_CTRL_C) break;
+            if (mask & SIGBREAKF_CTRL_D) break;
+        }
+    }         
+    D(bug("[AiRcOS](MPL) Application exiting ..\n"));
+    MUI_DisposeObject(AiRcOS_Base->aircos_app);
+}
+
+AROS_UFH3 ( void, menuprocess_func,
+    AROS_UFHA ( struct Hook*, h, A0 ),
+    AROS_UFHA ( APTR, obj, A2 ),
+    AROS_UFHA ( APTR, param, A1 ))
+{
+    AROS_USERFUNC_INIT
+
+D(bug("[AiRcOS] menuprocess_func()\n"));
+
+    switch ( *( int* )param )
+    {
+        case AiRcOS_MENUID_CONNECT:
+        {
+            set(AiRcOS_Base->aircos_quickconnectwin, MUIA_Window_Open, TRUE);
+            break;
+        }
+        case AiRcOS_MENUID_QUIT:
+        {
+            set(AiRcOS_Base->aircos_clientwin, MUIA_Window_Open, FALSE);
+            break;
+        }
+        case AiRcOS_MENUID_SERVERMANAGE:
+        {
+            set(serverconnectWin, MUIA_Window_Open, TRUE);
+            break;
+        }
+        default:
+            break;
+    }
+    AROS_USERFUNC_EXIT
+}
+
+//
+/* ************** MAIN/NORMAL PROGRAM ENTRY POINT *************** */
+//
+
+int main(int argc, char **argv)
+{
+    IPTR                    argarray[TOTAL_ARGS] = { 0 };
+    struct RDArgs           *args = NULL;
+    
+    BPTR                    lock = BNULL;
+
+//    struct IRC_Server_Priv  *irc_server_priv    = NULL;
+//    struct IRC_Channel_Priv  *irc_channel_priv  = NULL;
+
+    int                     error = RETURN_ERROR;
+	 struct MUI_CustomClass *custom_mcc = NULL;
+
+/**/
+    if (!(AiRcOS_Base = AllocMem(sizeof(struct AiRcOS_internal), MEMF_PUBLIC|MEMF_CLEAR)))
+    {
+      return error;
+    }
+D(bug("[AiRcOS](main) Allocated App Internal Base.\n"));
+
+    if (!(DOSBase = (struct DosLibrary *)OpenLibrary("dos.library", 37)))
+    {
+        error = ERROR_INVALID_RESIDENT_LIBRARY;
+        goto LibError;
+    }
+
+    Locale_Initialize();
+D(bug("[AiRcOS](main) Localisation Initialised.\n"));
+
+    MUIMasterBase = (struct Library*)OpenLibrary("muimaster.library",0);
+
+    if ((custom_mcc = MUI_CreateCustomClass(NULL, "TextEditor.mcc", NULL, sizeof (struct CustomTEInstData), TextEditor_Dispatcher)))
+    {
+        AiRcOS_Base->editor_mcc = custom_mcc;
+D(bug("[AiRcOS](main) Created TextEditor Custom Class @ %x\n", AiRcOS_Base->editor_mcc));
+
+        aircosApp__OpenBSDSOCKET();
+    
+        args = ReadArgs( ARG_TEMPLATE, argarray, NULL);
+    
+        if(!(AiRcOS_Base->Ai_pool = CreatePool(MEMF_CLEAR,(256*1024),(16*1024))))
+        {
+D(bug("[AiRcOS](main) Failed to allocate pool!!\n"));
+        }
+    
+        NewList((struct List *)&AiRcOS_Base->aircos_serverlist);
+        NewList((struct List *)&AiRcOS_Base->aircos_looseconnectionlist);
+
+        NewList((struct List *)&AiRcOS_Base->funcs_FunctionList);
+        NewList((struct List *)&AiRcOS_Base->funcs_ActionList);
+
+        aircos_IRCFuncs_RegisterFuncs();
+//        aircos_DCCFuncs_RegisterFuncs(void)
+
+        AiRcOS_Base->aircos_serv_no = 0;
+        struct NewMenu AiRcOs_Menus[] =
+        {
+        {NM_TITLE, _(MENU_PROJECT)},
+            {NM_ITEM, _(MENU_CONNECT), _(MENU_CONNECT_SC), 2, 0L, (APTR)AiRcOS_MENUID_CONNECT},
+            {NM_ITEM, _(MENU_CLOSE), _(MENU_CLOSE_SC),     2, 0L, (APTR)AiRcOS_MENUID_CLOSE},
+            {NM_ITEM, _(MENU_QUIT), _(MENU_QUIT_SC),       2, 0L, (APTR)AiRcOS_MENUID_QUIT},
+        {NM_TITLE, _(MENU_SETTINGS)},
+            {NM_ITEM, _(MENU_APP_OPTIONS), _(MENU_APP_OPTIONS_SC ),      2, 0L, (APTR)AiRcOS_MENUID_PREFS},
+            {NM_ITEM, _(MENU_SERVER_MANAGER), _(MENU_SERVER_MANAGER_SC), 2, 0L, (APTR)AiRcOS_MENUID_SERVERMANAGE},
+        {NM_TITLE, _(MENU_HELP)},
+            {NM_ITEM, _(MENU_APP_HELP), _(MENU_APP_HELP_SC),   2, 0L, (APTR)AiRcOS_MENUID_HELP},
+            {NM_ITEM, _(MENU_ABOUT), _(MENU_ABOUT_SC),         2, 0L, (APTR)AiRcOS_MENUID_ABOUT},
+        {NM_END}
+        };
+    /*
+    static struct NewMenu AiRcOs_Group_Opp_CMenu[] =
+    {
+        {NM_TITLE, "Project" },
+            {NM_ITEM, "Connect ..",             "Ctrl C",       2, 0L, (APTR)AiRcOS_MENUID_CONNECT},
+            {NM_ITEM, "Close connection",       "Ctrl X",       2, 0L, (APTR)AiRcOS_MENUID_CLOSE},
+            {NM_ITEM, "Quit",                  "Ctrl Q",        2, 0L, (APTR)AiRcOS_MENUID_QUIT},
+        {NM_TITLE, "Settings" },
+            {NM_ITEM, "Application Options",    "Ctrl P",       2, 0L, (APTR)AiRcOS_MENUID_PREFS},
+            {NM_ITEM, "Server Manager",    "Ctrl S",        2, 0L, (APTR)AiRcOS_MENUID_SERVERMANAGE},
+        {NM_TITLE, "Help" },
+            {NM_ITEM, "Application Help",      "Ctrl H",        2, 0L, (APTR)AiRcOS_MENUID_HELP},
+            {NM_ITEM, "About AiRcOS",         "Ctrl A",         2, 0L, (APTR)AiRcOS_MENUID_ABOUT},
+        {NM_END}
+    };
+    
+    static struct NewMenu AiRcOs_Group_Voice_CMenu[] =
+    {
+        {NM_TITLE, "Project" },
+            {NM_ITEM, "Connect ..",             "Ctrl C",       2, 0L, (APTR)AiRcOS_MENUID_CONNECT},
+            {NM_ITEM, "Close connection",       "Ctrl X",       2, 0L, (APTR)AiRcOS_MENUID_CLOSE},
+            {NM_ITEM, "Quit",                  "Ctrl Q",        2, 0L, (APTR)AiRcOS_MENUID_QUIT},
+        {NM_TITLE, "Settings" },
+            {NM_ITEM, "Application Options",    "Ctrl P",       2, 0L, (APTR)AiRcOS_MENUID_PREFS},
+            {NM_ITEM, "Server Manager",    "Ctrl S",        2, 0L, (APTR)AiRcOS_MENUID_SERVERMANAGE},
+        {NM_TITLE, "Help" },
+            {NM_ITEM, "Application Help",      "Ctrl H",        2, 0L, (APTR)AiRcOS_MENUID_HELP},
+            {NM_ITEM, "About AiRcOS",         "Ctrl A",         2, 0L, (APTR)AiRcOS_MENUID_ABOUT},
+        {NM_END}
+    };
+    
+    static struct NewMenu AiRcOs_Group_Normal_CMenu[] =
+    {
+        {NM_TITLE, "Project" },
+            {NM_ITEM, "Connect ..",             "Ctrl C",       2, 0L, (APTR)AiRcOS_MENUID_CONNECT},
+            {NM_ITEM, "Close connection",       "Ctrl X",       2, 0L, (APTR)AiRcOS_MENUID_CLOSE},
+            {NM_ITEM, "Quit",                  "Ctrl Q",        2, 0L, (APTR)AiRcOS_MENUID_QUIT},
+        {NM_TITLE, "Settings" },
+            {NM_ITEM, "Application Options",    "Ctrl P",       2, 0L, (APTR)AiRcOS_MENUID_PREFS},
+            {NM_ITEM, "Server Manager",    "Ctrl S",        2, 0L, (APTR)AiRcOS_MENUID_SERVERMANAGE},
+        {NM_TITLE, "Help" },
+            {NM_ITEM, "Application Help",      "Ctrl H",        2, 0L, (APTR)AiRcOS_MENUID_HELP},
+            {NM_ITEM, "About AiRcOS",         "Ctrl A",         2, 0L, (APTR)AiRcOS_MENUID_ABOUT},
+        {NM_END}
+    };
+    */
+    /* Get the speech icon image */
+        
+        lock = BNULL;
+        if ((lock = Lock(SPEEKTYPE_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_speekimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_speekimg = FALSE;
+        
+    /* Get the user icon image */
+        
+        lock = BNULL;
+        if ((lock = Lock(USERTYPE_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_userimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_userimg = FALSE;
+    
+    /* Get the font etc icons */
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_BACK_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontbaimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontbaimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_BOLD_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontboimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontboimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_COLOR_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontcoimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontcoimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_DEF_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontdeimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontdeimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_ITAL_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontitimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontitimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_LARGE_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontlaimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontlaimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_SMALL_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontsmimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontsmimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(FONT_UNDER_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_fontunimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_fontunimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(POP_PIC_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_poppicimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_poppicimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(POP_SMILEY_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_popsmiimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_popsmiimg = FALSE;
+        
+        lock = BNULL;
+        if ((lock = Lock(POP_URL_IMAGE, ACCESS_READ)) != BNULL)
+        {
+            AiRcOS_Base->aircos_got_popurlimg = TRUE;
+    
+            UnLock(lock);
+        }
+        else AiRcOS_Base->aircos_got_popurlimg = FALSE;
+D(bug("[AiRcOS](main) Base gadget Images locked\n"));
+    /**/
+    
+        AiRcOS_Base->aircos_app = ApplicationObject,
+            MUIA_Application_Title,       __(MSG_TITLE),
+            MUIA_Application_Version,     (IPTR) "$VER: AiRcOS 0.6 (30.04.06) �AROS Dev Team",
+            MUIA_Application_Copyright,   (IPTR) "Copyright � 2005-2006, The AROS Development Team. All rights reserved.",
+            MUIA_Application_Author,      (IPTR) "Nick Andrews",
+            MUIA_Application_Description, __(MSG_DESCRIPTION),
+            MUIA_Application_Base,        (IPTR) "AIRCOS",
+    
+            SubWindow, (IPTR) (AiRcOS_Base->aircos_clientwin = WindowObject,
+                MUIA_Window_Menustrip,(IPTR) ( AiRcOS_Base->aircos_clientwin_menu = MUI_MakeObject(MUIO_MenustripNM,
+                    (IPTR)AiRcOs_Menus, (IPTR)NULL)),
+    
+                MUIA_Window_Title, __(MSG_WIN_TITLE),
+                MUIA_Window_Activate, TRUE,
+                MUIA_Window_Width,600,
+                MUIA_Window_Height,400,
+         
+                WindowContents, (IPTR) HGroup,
+                    Child, (IPTR) (AiRcOS_Base->aircos_window_content = VGroup,
+                        Child, (IPTR) (AiRcOS_Base->aircos_window_page = VGroup,
+                            InputListFrame,
+                            MUIA_Background, MUII_HSHADOWSHADOW,
+                            Child, RectangleObject,
+                            End,
+                        End),
+                    End),
+                End,
+            End),
+    
+            SubWindow, (IPTR) (AiRcOS_Base->aircos_quickconnectwin = WindowObject,
+                MUIA_Window_Title, _(MSG_SERVER_CONNECT),
+                MUIA_Window_Activate, TRUE,
+         
+                WindowContents, (IPTR) VGroup,
+                    Child, (IPTR) VGroup, 
+                        GroupFrame,
+                        Child, (IPTR) ColGroup(2),
+                            Child, (IPTR) LLabel(_(MSG_SERVER_ADDRESS)),
+                                Child, (IPTR) (AiRcOS_Base->quickcon_servadd = StringObject,
+                                    StringFrame,
+                                    MUIA_CycleChain, 1,
+                                        MUIA_String_Format, MUIV_String_Format_Right,
+                                End ),
+                                Child, (IPTR) LLabel(_(MSG_SERVER_PORT)),
+                                Child, (IPTR) (AiRcOS_Base->quickcon_servport = StringObject,
+                                    StringFrame,
+                                    MUIA_CycleChain, 1,
+                                        MUIA_String_Format, MUIV_String_Format_Right,
+                                        MUIA_String_Accept, "0123456789",
+                                        MUIA_String_Integer, 0,
+                                End ),
+                                Child, (IPTR) LLabel(_(MSG_USERNAME)),
+                                Child, (IPTR) (AiRcOS_Base->quickcon_servuser = StringObject,
+                                    StringFrame,
+                                    MUIA_CycleChain, 1,
+                                        MUIA_String_Format, MUIV_String_Format_Left,
+                                    End ),
+                                Child, (IPTR) LLabel(_(MSG_PASSWORD)),
+                                Child, (IPTR) (AiRcOS_Base->quickcon_servpass = StringObject,
+                                    StringFrame,
+                                    MUIA_CycleChain, 1,
+                                        MUIA_String_Format, MUIV_String_Format_Left,
+                                        MUIA_String_Secret, TRUE,
+                                    End ),
+                        End,
+                    End,
+                    Child, (IPTR) VGroup,
+                        GroupFrame,
+                        Child, (IPTR) ColGroup(2),
+                                Child, (IPTR) LLabel(_(MSG_NICKNAME)),
+                                Child, (IPTR) (AiRcOS_Base->quickcon_nick = StringObject,
+                                    StringFrame,
+                                    MUIA_CycleChain, 1,
+                                        MUIA_String_Format, MUIV_String_Format_Left,
+                                    End ),
+                                Child, (IPTR) LLabel(_(MSG_JOIN)),
+                                Child, (IPTR) (AiRcOS_Base->quickcon_channel = StringObject,
+                                    StringFrame,
+                                    MUIA_CycleChain, 1,
+                                        MUIA_String_Format, MUIV_String_Format_Left,
+                                    End ),
+                        End,
+                    End,
+                    Child, (IPTR) (AiRcOS_Base->butt_connectServer = SimpleButton(_(MSG_CONNECT))),
+                End,
+            End),
+        End;
+
+       if (AiRcOS_Base->aircos_app)
+       {
+
+D(bug("[AiRcOS](main) Zune Application Objects Created\n"));
+    
+         AiRcOS_Base->aircos_menuhook.h_MinNode.mln_Succ = NULL;
+         AiRcOS_Base->aircos_menuhook.h_MinNode.mln_Pred = NULL;
+         AiRcOS_Base->aircos_menuhook.h_Entry = HookEntry;
+         AiRcOS_Base->aircos_menuhook.h_SubEntry = (void *)menuprocess_func;
+    
+         DoMethod (
+            AiRcOS_Base->aircos_clientwin, MUIM_Notify, MUIA_Window_MenuAction, MUIV_EveryTime,
+            ( IPTR ) AiRcOS_Base->aircos_app, 3, MUIM_CallHook, ( IPTR )&AiRcOS_Base->aircos_menuhook, MUIV_EveryTime
+         );
+    
+         set( (APTR)AiRcOS_Base->butt_connectServer, MUIA_CycleChain, 1);
+    
+         set( (APTR)AiRcOS_Base->quickcon_servadd, MUIA_String_Contents, _(MSG_DEFAULT_SERVER));
+         set( (APTR)AiRcOS_Base->quickcon_servport, MUIA_String_Integer, 6665);
+         set( (APTR)AiRcOS_Base->quickcon_servpass, MUIA_String_Contents,"");
+         set( (APTR)AiRcOS_Base->quickcon_channel, MUIA_String_Contents, _(MSG_DEFAULT_CHAN));
+    
+    
+D(bug("[AiRcOS] prepare connect hook\n"));
+    
+         AiRcOS_Base->aircos_connect_hook.h_MinNode.mln_Succ = NULL;
+         AiRcOS_Base->aircos_connect_hook.h_MinNode.mln_Pred = NULL;
+         AiRcOS_Base->aircos_connect_hook.h_Entry = HookEntry;
+         AiRcOS_Base->aircos_connect_hook.h_SubEntry = (void *)serverconnect_func;
+    
+         DoMethod
+         (
+            AiRcOS_Base->aircos_clientwin, MUIM_Notify, MUIA_Window_CloseRequest, TRUE,
+            (IPTR) AiRcOS_Base->aircos_app, 2, MUIM_Application_ReturnID, MUIV_Application_ReturnID_Quit
+         );
+    
+         DoMethod
+         (
+            AiRcOS_Base->butt_connectServer, MUIM_Notify, MUIA_Pressed, FALSE,
+                (IPTR) AiRcOS_Base->aircos_app, 3, MUIM_CallHook, &AiRcOS_Base->aircos_connect_hook, NULL
+         );
+    
+      /* ********** WINDOW KEY NOTIFIES ********** */
+    
+         DoMethod
+         (
+                AiRcOS_Base->aircos_clientwin, MUIM_Notify, MUIA_Window_InputEvent, "f2",
+                AiRcOS_Base->aircos_quickconnectwin, 3, MUIM_Set, MUIA_Window_Open, TRUE
+         );
+    
+          set((APTR)AiRcOS_Base->aircos_clientwin, MUIA_Window_Open, TRUE);
+
+          serverconnectWin = aircos_showServerConnect(); 
+          aircosApp_loadPrefs();
+
+          set((APTR)AiRcOS_Base->quickcon_servuser, MUIA_String_Contents, aircos_Prefs_DefUser);
+          set((APTR)AiRcOS_Base->quickcon_nick, MUIA_String_Contents, aircos_Prefs_DefNick);
+          set((APTR)AiRcOS_Base->aircos_quickconnectwin, MUIA_Window_Open, TRUE);
+
+          aircosApp_MainProcessLoop();
+        }
+        else
+        {
+            printf("Failed to intialize Zune GUI\n");
+        }
+    
+    /** CLOSE ALL OPEN SERVER CONNECTIONS! **/
+D(bug("[AiRcOS](main) Closing Active connections\n"));
+       struct IRC_Server_Priv *current_Server=NULL;
+       ForeachNode(&AiRcOS_Base->aircos_serverlist, current_Server)
+       {
+          if ((SocketBase)&&(current_Server->serv_connection))
+          {
+             Remove(&current_Server->serv_connection->connection_node);
+             Remove(&current_Server->serv_node);
+             aircosApp_closeConnection(current_Server->serv_connection);
+          }
+       
+       }
+    
+    /** CLOSE ALL LOOSE CONNECTIONS! **/
+D(bug("[AiRcOS](main) Closing Loose connections\n"));
+       struct IRC_Connection_Private	*current_Connection=NULL;
+       ForeachNode(&AiRcOS_Base->aircos_looseconnectionlist, current_Connection)
+       {
+             Remove(&current_Connection->connection_node);
+             aircosApp_closeConnection(current_Connection);
+       }
+D(bug("[AiRcOS](main) Application finished ..\n"));
+   }
+   else
+   {
+D(bug("[AiRcOS](main) Failed to create TextEditor Custom Class!!\n"));
+   }
+
+    if (args) FreeArgs(args);
+
+    Locale_Deinitialize();
+
+LibError:
+    if (SocketBase) CloseLibrary((struct Library *)SocketBase);
+
+    if (MUIMasterBase) CloseLibrary((struct Library *)MUIMasterBase);
+
+    if (DOSBase) CloseLibrary((struct Library *)DOSBase);
+
+    return(error);
+}
+
+/*
+    Copyright � 2002, The AROS Development Team.
+    All rights reserved.
+
+    $Id$
+*/
+
+//#include    <exec/types.h>
+#include    <stdlib.h>
+#include    <stdio.h>
+#include    <string.h>
+
+#include    <proto/alib.h>
+#include    <proto/exec.h>
+#include    <proto/dos.h>
+#include    <proto/intuition.h>
+#include    <proto/muimaster.h>
+#include    <proto/utility.h>
+
+#include    <dos/dos.h>
+#include    <intuition/gadgetclass.h>
+#include    <intuition/icclass.h>
+#include    <clib/alib_protos.h>
+
+#include <libraries/mui.h>
+#include <mui/NListtree_mcc.h>
+#include <mui/NListview_mcc.h>
+#include <mui/NList_mcc.h>
+
+#include "aircos_global.h"
+#include "locale.h"
+
+extern struct AiRcOS_internal *AiRcOS_Base;
+struct List                   aircos_Prefs_ServerNetworks;
+struct List                   aircos_Prefs_Servers;
+struct aircos_servernode      *aircos_Prefs_ServerActive;
+struct Hook                   aircos_serversave_hook;
+struct Hook                   aircos_networklistupdate_hook;
+struct Hook                   aircos_serverlistupdate_hook;
+struct Hook                   aircos_chooseserver_hook;
+
+BOOL                          aircos_Prefs_ServersLoaded = FALSE;
+
+Object	                     *input_server_address = NULL;
+Object	                     *input_server_port =  NULL;
+Object	                     *input_server_description =  NULL;
+Object	                     *input_server_network =  NULL;
+Object	                     *input_server_pass =  NULL;
+
+Object                        *select_dropboxgrp_network = NULL;
+Object                        *select_dropbox_network = NULL;
+Object                        *select_dropboxgrp_server = NULL;
+Object                        *select_dropbox_server = NULL;
+
+STRPTR	                     network_list_empty[2] =
+{
+  "<List Empty>",
+  NULL
+};
+STRPTR	                     server_list_empty[2] =
+{
+  "<List Empty>",
+  NULL
+};
+Object	                     *servermodWin;
+STRPTR	                     *network_list;
+STRPTR	                     *server_list;
+
+//network_list_empty[0] = "<List Empty>";		//MSG(MSG_LIST_EMPTY);
+//network_list_empty[1] = NULL;
+
+//server_list_empty[0] = "<List Empty>";		//MSG(MSG_LIST_EMPTY);
+//server_list_empty[1] = NULL;
+
+#define AIRCOS_DEF_SERVERSFILE "servers.dat"
+
+void aircosApp_LoadServers()
+{
+  aircos_Prefs_ServersLoaded = TRUE;
+}
+
+struct aircos_networknode *aircosApp_FindServerNetworkNode(char * findNetwork)
+{
+  struct aircos_networknode *current_Node = NULL;
+  ForeachNode(&aircos_Prefs_ServerNetworks, current_Node)
+  {
+D(bug("[AiRcOS](FindServerNetworkNode) Checking against record for '%s'\n", current_Node->ann_Network));
+      if (strcasecmp(current_Node->ann_Network, findNetwork)==0) return current_Node;
+  }
+  return NULL;
+}
+
+struct aircos_servernode  *aircosApp_FindServerNode(char * findServer)
+{
+struct aircos_servernode  *current_Node = NULL;
+  ForeachNode(&aircos_Prefs_Servers, current_Node)
+  {
+D(bug("[AiRcOS](FindServerNode) Checking against record for '%s'\n", current_Node->asn_Server));
+      if (strcasecmp(current_Node->asn_Server, findServer)==0) return current_Node;
+  }
+  return NULL;
+}
+
+AROS_UFH3(void, chooseserver_func,
+   AROS_UFHA(struct Hook *, unused_hook, A0),
+   AROS_UFHA(APTR, obj, A2),
+   AROS_UFHA(struct IRC_Channel_Priv  *, hook_channel_arg, A1 ))
+{
+   AROS_USERFUNC_INIT
+D(bug("[AiRcOS] chooseserver_func()\n"));
+  ULONG                      currentPrefsServerID;
+  get(select_dropbox_server, MUIA_Cycle_Active, &currentPrefsServerID);
+
+  struct aircos_servernode *currentPrefsServer = NULL;
+  if (!(currentPrefsServer = aircosApp_FindServerNode(server_list[currentPrefsServerID])))
+  {
+D(bug("[AiRcOS] chooseserver_func: Couldnt find Server Node!\n"));
+    return;
+  }
+
+  aircos_Prefs_ServerActive = currentPrefsServer;
+
+  AROS_USERFUNC_EXIT
+};
+
+AROS_UFH3(void, updatenetworklist_func,
+   AROS_UFHA(struct Hook *, unused_hook, A0),
+   AROS_UFHA(APTR, obj, A2),
+   AROS_UFHA(struct IRC_Channel_Priv  *, hook_channel_arg, A1 ))
+{
+   AROS_USERFUNC_INIT
+D(bug("[AiRcOS] updatenetworklist_func()\n"));
+  struct aircos_networknode *currentPrefsNetwork = NULL;
+  ULONG                      prefsNetworkCount = 0;
+  ULONG                      setprefsNetworkActive = 0;
+  Object                     *new_dropbox_network = NULL;
+  
+  ForeachNode(&aircos_Prefs_ServerNetworks, currentPrefsNetwork)
+  {
+      prefsNetworkCount++;
+      if (aircos_Prefs_ServerActive)
+        if (strcasecmp(currentPrefsNetwork->ann_Network, aircos_Prefs_ServerActive->asn_Network->ann_Network)==0)
+        {
+          setprefsNetworkActive = prefsNetworkCount -1;
+        }
+  }
+
+D(bug("[AiRcOS] updatenetworklist_func: %d network nodes\n", prefsNetworkCount));
+  
+  if (prefsNetworkCount > 0)
+  {
+    if (network_list != network_list_empty) {
+      FreeVec(network_list);
+    }
+    
+    if ((network_list = AllocVec(sizeof(IPTR) * prefsNetworkCount+1, MEMF_CLEAR|MEMF_PUBLIC)))
+    {
+      int loop_count = 0;
+
+      ForeachNode(&aircos_Prefs_ServerNetworks, currentPrefsNetwork)
+      {
+        network_list[loop_count] = currentPrefsNetwork->ann_Network;
+        loop_count++;
+      }
+    }
+    else
+    {
+D(bug("[AiRcOS] updatenetworklist_func: ERROR - couldnt allocate memory for network name pointer table\n"));
+      network_list = network_list_empty;
+    }
+  } else if (network_list != network_list_empty) {
+    FreeVec(network_list);
+    network_list = network_list_empty; 
+  }
+
+  if (!(new_dropbox_network = MUI_MakeObject(MUIO_Cycle, NULL, network_list)))
+  {
+D(bug("[AiRcOS] updatenetworklist_func: Failed to create Network dropdown\n"));
+    return;
+  }
+
+  if (DoMethod(select_dropboxgrp_network, MUIM_Group_InitChange))
+  {
+    DoMethod(select_dropboxgrp_network, OM_REMMEMBER, select_dropbox_network);
+    DoMethod(select_dropboxgrp_network, OM_ADDMEMBER, new_dropbox_network);
+    DoMethod(select_dropboxgrp_network, MUIM_Group_ExitChange);
+    select_dropbox_network = new_dropbox_network;
+  }
+
+  DoMethod(select_dropbox_network, MUIM_NoNotifySet, MUIA_Cycle_Active, setprefsNetworkActive);
+  DoMethod
+  (
+      select_dropbox_network, MUIM_Notify, MUIA_Cycle_Active, MUIV_EveryTime,
+      (IPTR) AiRcOS_Base->aircos_app, 3, MUIM_CallHook, &aircos_serverlistupdate_hook, NULL
+  );
+        
+  AROS_USERFUNC_EXIT
+};
+
+AROS_UFH3(void, updateserverlist_func,
+   AROS_UFHA(struct Hook *, unused_hook, A0),
+   AROS_UFHA(APTR, obj, A2),
+   AROS_UFHA(struct IRC_Channel_Priv  *, hook_channel_arg, A1 ))
+{
+   AROS_USERFUNC_INIT
+D(bug("[AiRcOS] updateserverlist_func()\n"));
+  struct aircos_servernode   *currentPrefsServer = NULL;
+  ULONG                      prefsNetworkServerCount = 0;
+  ULONG                      setprefsServerActive = 0;
+  Object                     *new_dropbox_server = NULL;
+
+  ULONG                      currentPrefsNetworkID;
+  get(select_dropbox_network, MUIA_Cycle_Active, &currentPrefsNetworkID);
+
+  struct aircos_networknode *currentPrefsNetwork = NULL;
+  if (!(currentPrefsNetwork = aircosApp_FindServerNetworkNode(network_list[currentPrefsNetworkID])))
+  {
+D(bug("[AiRcOS] updateserverlist_func: Couldnt find Network Node!\n"));
+    return;
+  }
+
+  ForeachNode(&aircos_Prefs_Servers, currentPrefsServer)
+  {
+      if (strcasecmp(currentPrefsServer->asn_Network->ann_Network, currentPrefsNetwork->ann_Network)==0)
+      {
+        prefsNetworkServerCount++;
+        if (aircos_Prefs_ServerActive)
+          if (strcasecmp(currentPrefsServer->asn_Server, aircos_Prefs_ServerActive->asn_Server)==0)
+          {
+            setprefsServerActive = prefsNetworkServerCount -1;
+          }
+      }
+  }
+
+D(bug("[AiRcOS] updateserverlist_func: %d server nodes for network '%s'\n", prefsNetworkServerCount, currentPrefsNetwork->ann_Network));
+  
+  if (prefsNetworkServerCount > 0)
+  {
+    if (server_list != server_list_empty) {
+      FreeVec(server_list);
+    }
+    
+    if ((server_list = AllocVec(sizeof(IPTR) * prefsNetworkServerCount+1, MEMF_CLEAR|MEMF_PUBLIC)))
+    {
+      int loop_count = 0;
+
+      ForeachNode(&aircos_Prefs_Servers, currentPrefsServer)
+      {
+        if (strcasecmp(currentPrefsServer->asn_Network->ann_Network, currentPrefsNetwork->ann_Network)==0)
+        {
+          server_list[loop_count] = currentPrefsServer->asn_Server;
+          loop_count++;
+        }
+      }
+    }
+    else
+    {
+D(bug("[AiRcOS] updateserverlist_func: ERROR - couldnt allocate memory for server name pointer table\n"));
+      server_list = server_list_empty;
+    }
+  } else if (server_list != server_list_empty) {
+    FreeVec(server_list);
+    server_list = server_list_empty; 
+  }
+
+  if (!(new_dropbox_server = MUI_MakeObject(MUIO_Cycle, NULL, server_list)))
+  {
+D(bug("[AiRcOS] updateserverlist_func: Failed to create Server dropdown\n"));
+    return;
+  }
+
+  if (DoMethod(select_dropboxgrp_server, MUIM_Group_InitChange))
+  {
+    DoMethod(select_dropboxgrp_server, OM_REMMEMBER, select_dropbox_server);
+    DoMethod(select_dropboxgrp_server, OM_ADDMEMBER, new_dropbox_server);
+    DoMethod(select_dropboxgrp_server, MUIM_Group_ExitChange);
+    select_dropbox_server = new_dropbox_server;
+  }
+
+  DoMethod(select_dropbox_server, MUIM_NoNotifySet, MUIA_Cycle_Active, setprefsServerActive);
+
+  AROS_USERFUNC_EXIT
+};
+
+AROS_UFH3(void, serversave_func,
+   AROS_UFHA(struct Hook *, unused_hook, A0),
+   AROS_UFHA(APTR, obj, A2),
+   AROS_UFHA(struct IRC_Channel_Priv  *, hook_channel_arg, A1 ))
+{
+   AROS_USERFUNC_INIT
+D(bug("[AiRcOS] serversave_func()\n"));
+
+  struct aircos_networknode *newsaveNetwork = NULL;
+  char                      *newsaveNetwork_name;
+  BOOL                      newsaveNetwork_update = FALSE;
+
+  struct aircos_servernode  *newsaveServer = NULL;
+  char                      *newsaveServer_name;
+  BOOL                      newsaveServer_update = FALSE;
+
+   get( input_server_network, MUIA_String_Contents, &newsaveNetwork_name);
+   get( input_server_address, MUIA_String_Contents, &newsaveServer_name);
+
+  if (!(newsaveNetwork = aircosApp_FindServerNetworkNode(newsaveNetwork_name)))
+  {
+D(bug("[AiRcOS](serversave_func) created new network node for '%s'\n", newsaveNetwork_name));
+     newsaveNetwork = AllocVec(sizeof(struct aircos_networknode), MEMF_CLEAR|MEMF_PUBLIC);
+     newsaveNetwork->ann_Network = AllocVec(strlen(newsaveNetwork_name)+1, MEMF_CLEAR|MEMF_PUBLIC);
+     CopyMem(newsaveNetwork_name, newsaveNetwork->ann_Network, strlen(newsaveNetwork_name)+1);
+
+     AddTail((struct List *)&aircos_Prefs_ServerNetworks, (struct Node *)&newsaveNetwork->ann_Node);
+     newsaveNetwork_update = TRUE;
+  }
+  newsaveNetwork->ann_ServerCount += 1;
+D(bug("[AiRcOS](serversave_func) %s Network node server count = %d\n", newsaveNetwork->ann_Network, newsaveNetwork->ann_ServerCount));
+
+  if (!(newsaveServer = aircosApp_FindServerNode(newsaveServer_name)))
+  {
+D(bug("[AiRcOS](serversave_func) created new server node for '%s'\n", newsaveServer_name));
+     newsaveServer = AllocVec(sizeof(struct aircos_servernode), MEMF_CLEAR|MEMF_PUBLIC);
+     newsaveServer->asn_Server = AllocVec(strlen(newsaveServer_name)+1, MEMF_CLEAR|MEMF_PUBLIC);
+     CopyMem(newsaveServer_name, newsaveServer->asn_Server, strlen(newsaveServer_name)+1);
+     newsaveServer->asn_Network = newsaveNetwork;
+     get( input_server_port, MUIA_String_Integer, &newsaveServer->asn_Port);
+
+// TODO: we need to store the password also here .."
+
+     AddTail((struct List *)&aircos_Prefs_Servers, (struct Node *)&newsaveServer->asn_Node);
+     newsaveServer_update = TRUE;
+  }
+  else
+  {
+D(bug("[AiRcOS](serversave_func) node already exists for server '%s'\n", newsaveServer_name));
+  }
+
+  aircos_Prefs_ServerActive = newsaveServer;
+
+  set( servermodWin, MUIA_Window_Open, FALSE);
+
+  if (newsaveNetwork_update) CallHookPkt(&aircos_networklistupdate_hook, obj, hook_channel_arg);
+  if (newsaveServer_update) CallHookPkt(&aircos_serverlistupdate_hook, obj, hook_channel_arg);
+
+  AROS_USERFUNC_EXIT
+};
+
+Object	*aircos_showServerConnect()
+{
+D(bug("[AiRcOS] showServerConnect()\n"));
+  if (aircos_Prefs_ServersLoaded)
+  {
+D(bug("[AiRcOS](showServerConnect) Server windows already configured!\n"));
+    return NULL;
+  }
+
+   Object   *tmp_connectWin = NULL;
+
+  NewList((struct List *)&aircos_Prefs_ServerNetworks);
+  NewList((struct List *)&aircos_Prefs_Servers);
+
+	Object	*butt_addServer = NULL;
+	Object	*butt_editServer = NULL;
+	Object	*butt_delServer = NULL;
+	Object	*butt_serverConnect = NULL;
+	Object   *butt_serverSave = NULL;
+
+   network_list = network_list_empty;
+   server_list = server_list_empty;
+
+	if (!(select_dropbox_network = MUI_MakeObject(MUIO_Cycle, NULL, network_list)))
+	{
+D(bug("[AiRcOS](showServerConnect) Failed to create Network dropdown\n"));
+      return NULL;
+	}
+	
+	if (!(select_dropbox_server = MUI_MakeObject(MUIO_Cycle, NULL, server_list)))
+	{
+D(bug("[AiRcOS](showServerConnect) Failed to create Server dropdown\n"));
+      return NULL;
+	}
+
+   if (!(butt_addServer = SimpleButton("Add")))
+	{
+D(bug("[AiRcOS](showServerConnect) Failed to create 'ADD' button\n"));
+      return NULL;
+	}
+	
+   if (!(butt_editServer = SimpleButton("Edit")))
+	{
+D(bug("[AiRcOS](showServerConnect) Failed to create 'EDIT' button\n"));
+      return NULL;
+	}
+	
+   if (!(butt_delServer = SimpleButton("Del")))
+	{
+D(bug("[AiRcOS](showServerConnect) Failed to create 'DEL' button\n"));
+      return NULL;
+	}
+
+   if (!(butt_serverConnect = SimpleButton("Connect!")))
+	{
+D(bug("[AiRcOS](showServerConnect) Failed to create 'CONNECT' button\n"));
+      return NULL;
+	}
+
+   if (!(butt_serverSave = SimpleButton("Save!")))
+	{
+D(bug("[AiRcOS](showServerConnect) Failed to create 'SAVE' button\n"));
+      return NULL;
+	}
+
+   select_dropboxgrp_network = VGroup,
+                                 Child, (IPTR) select_dropbox_network,
+                               End;
+
+   select_dropboxgrp_server = VGroup,
+                                Child, (IPTR) select_dropbox_server,
+                              End;
+
+	tmp_connectWin = WindowObject,
+            MUIA_Window_Title, (IPTR) "Connect to Server..",
+            MUIA_Window_Activate, TRUE,
+            MUIA_Window_Width,200,
+            MUIA_Window_Height,200,
+     
+            WindowContents, (IPTR) VGroup,
+                Child, (IPTR) HGroup,
+                  GroupFrame,
+					   Child, (IPTR) VGroup,
+						  Child, (IPTR) LLabel("IRC Network"),
+						  Child, (IPTR) HGroup,
+						    Child, (IPTR) HSpace(0),
+						    Child, (IPTR) select_dropboxgrp_network,
+						    Child, (IPTR) HSpace(0),
+						  End,
+					   End,
+					   Child, (IPTR) HVSpace,
+                End,
+                Child, (IPTR) HGroup,
+                  GroupFrame,
+					   Child, (IPTR) VGroup,
+						  Child, (IPTR) LLabel("IRC Server"),
+						  Child, (IPTR) HGroup,
+						    Child, (IPTR) HVSpace,
+						    Child, (IPTR) select_dropboxgrp_server,
+						    Child, (IPTR) HVSpace,
+						  End,
+					   End,
+  					   Child, (IPTR) HVSpace,
+                End,
+                Child, (IPTR) HGroup,
+					   Child, (IPTR) HVSpace,
+					   Child, (IPTR) butt_addServer,
+					   Child, (IPTR) butt_editServer,
+					   Child, (IPTR) butt_delServer,
+                End,
+                Child, (IPTR) butt_serverConnect,
+            End,
+        End;
+
+	servermodWin = WindowObject,
+        
+            MUIA_Window_Title, (IPTR) "Edit Server..",
+            MUIA_Window_Activate, TRUE,
+            MUIA_Window_Width,350,
+            MUIA_Window_Height,400,
+     
+            WindowContents, (IPTR) VGroup,
+               Child, (IPTR) VGroup,
+                 GroupFrame,
+                 Child, (IPTR) HGroup,
+					    Child, (IPTR) LLabel("IRC Server Address"),
+					    Child, (IPTR) (input_server_address = StringObject,
+										StringFrame,
+                              MUIA_CycleChain, TRUE,
+										MUIA_String_Format, MUIV_String_Format_Right,
+                   End ),
+                 End,
+                 Child, (IPTR) HGroup,
+					    Child, (IPTR) LLabel("Port"),
+					    Child, (IPTR) (input_server_port = StringObject,
+										StringFrame,
+                              MUIA_CycleChain, TRUE,
+										MUIA_String_Format, MUIV_String_Format_Right,
+										MUIA_String_Accept, "0123456789",
+										MUIA_String_Integer, 0,
+					    End),
+                 End,
+                 Child, (IPTR) HGroup,
+					    Child, (IPTR) LLabel("Server Description"),
+					    Child, (IPTR) (input_server_description = StringObject,
+										StringFrame,
+                              MUIA_CycleChain, TRUE,
+										MUIA_String_Format, MUIV_String_Format_Right,
+					    End),
+                 End,
+                 Child, (IPTR) HGroup,
+					    Child, (IPTR) LLabel("IRC Network"),
+					    Child, (IPTR) (input_server_network = StringObject,
+										StringFrame,
+                              MUIA_CycleChain, TRUE,
+										MUIA_String_Format, MUIV_String_Format_Right,
+					    End),
+                 End,
+               End,
+               Child, (IPTR) VGroup,
+                 GroupFrame,
+				     Child, (IPTR) LLabel("Enter server password here if applicable."),
+                 Child, (IPTR) HGroup,
+					    Child, (IPTR) LLabel("Password"),
+					    Child, (IPTR) (input_server_pass = StringObject,
+										StringFrame,
+                              MUIA_CycleChain, TRUE,
+										MUIA_String_Format, MUIV_String_Format_Right,
+					    End),
+                 End,
+               End,
+               Child, (IPTR) butt_serverSave,
+            End,
+        End;
+
+	if ((tmp_connectWin)&&(servermodWin))
+	{
+D(bug("[AiRcOS](showServerConnect) Created GUI objects\n"));
+      DoMethod
+        (
+            AiRcOS_Base->aircos_app, OM_ADDMEMBER,
+            (IPTR) tmp_connectWin
+        );
+
+      DoMethod
+        (
+            AiRcOS_Base->aircos_app, OM_ADDMEMBER,
+            (IPTR) servermodWin
+        );
+
+        DoMethod
+        (
+            tmp_connectWin, MUIM_Notify, MUIA_Window_Open, TRUE,
+            (IPTR) AiRcOS_Base->aircos_quickconnectwin, 3, MUIM_Set, MUIA_Window_Open, FALSE
+        );
+
+        DoMethod
+        (
+            AiRcOS_Base->aircos_quickconnectwin, MUIM_Notify, MUIA_Window_Open, TRUE,
+            (IPTR) tmp_connectWin, 3, MUIM_Set, MUIA_Window_Open, FALSE
+        );
+
+        DoMethod
+        (
+            tmp_connectWin, MUIM_Notify, MUIA_Window_Open, FALSE,
+            (IPTR) servermodWin, 3, MUIM_Set, MUIA_Window_Open, FALSE
+        );
+
+      DoMethod
+        (
+            butt_addServer, MUIM_Notify, MUIA_Selected, FALSE,
+            (IPTR) servermodWin, 3, MUIM_Set, MUIA_Window_Open, TRUE
+        );
+
+      DoMethod
+        (
+            butt_editServer, MUIM_Notify, MUIA_Selected, FALSE,
+            (IPTR) servermodWin, 3, MUIM_Set, MUIA_Window_Open, TRUE
+        );
+
+//      DoMethod
+//        (
+//            butt_delServer, MUIM_Notify, MUIA_Selected, FALSE,
+//            (IPTR) servermodWin, 3, MUIM_Set, MUIA_ShowMe, FALSE
+//        );
+
+        DoMethod
+        (
+            tmp_connectWin, MUIM_Notify, MUIA_Window_CloseRequest, TRUE,
+            (IPTR) tmp_connectWin, 3, MUIM_Set, MUIA_Window_Open, FALSE
+        );
+        
+        DoMethod
+        (
+            servermodWin, MUIM_Notify, MUIA_Window_CloseRequest, TRUE,
+            (IPTR) servermodWin, 3, MUIM_Set, MUIA_Window_Open, FALSE
+        );
+
+        DoMethod
+        (
+            butt_serverConnect, MUIM_Notify, MUIA_Pressed, FALSE,
+                (IPTR) AiRcOS_Base->aircos_app, 3, MUIM_CallHook, &AiRcOS_Base->aircos_connect_hook, NULL
+        );
+
+D(bug("[AiRcOS](showServerConnect) prepare list update hooks\n"));
+    
+       aircos_serversave_hook.h_MinNode.mln_Succ = NULL;
+       aircos_serversave_hook.h_MinNode.mln_Pred = NULL;
+       aircos_serversave_hook.h_Entry = HookEntry;
+       aircos_serversave_hook.h_SubEntry = (void *)serversave_func;
+
+       aircos_networklistupdate_hook.h_MinNode.mln_Succ = NULL;
+       aircos_networklistupdate_hook.h_MinNode.mln_Pred = NULL;
+       aircos_networklistupdate_hook.h_Entry = HookEntry;
+       aircos_networklistupdate_hook.h_SubEntry = (void *)updatenetworklist_func;
+       
+       aircos_serverlistupdate_hook.h_MinNode.mln_Succ = NULL;
+       aircos_serverlistupdate_hook.h_MinNode.mln_Pred = NULL;
+       aircos_serverlistupdate_hook.h_Entry = HookEntry;
+       aircos_serverlistupdate_hook.h_SubEntry = (void *)updateserverlist_func;
+
+       aircos_chooseserver_hook.h_MinNode.mln_Succ = NULL;
+       aircos_chooseserver_hook.h_MinNode.mln_Pred = NULL;
+       aircos_chooseserver_hook.h_Entry = HookEntry;
+       aircos_chooseserver_hook.h_SubEntry = (void *)chooseserver_func;
+
+        DoMethod
+        (
+            butt_serverSave, MUIM_Notify, MUIA_Pressed, FALSE,
+                (IPTR) AiRcOS_Base->aircos_app, 3, MUIM_CallHook, &aircos_serversave_hook, NULL
+        );
+
+        DoMethod
+        (
+            select_dropbox_network, MUIM_Notify, MUIA_Cycle_Active, MUIV_EveryTime,
+                (IPTR) AiRcOS_Base->aircos_app, 3, MUIM_CallHook, &aircos_serverlistupdate_hook, NULL
+        );
+
+        DoMethod
+        (
+            select_dropbox_server, MUIM_Notify, MUIA_Cycle_Active, MUIV_EveryTime,
+                (IPTR) AiRcOS_Base->aircos_app, 3, MUIM_CallHook, &aircos_chooseserver_hook, NULL
+        );
+
+D(bug("[AiRcOS](showServerConnect) Configured NOTIFICATIONS\n"));
+
+       set(tmp_connectWin, MUIA_Window_Open, TRUE);
+       D(bug("[AiRcOS](showServerConnect) Window opened ..\n"));
+     }
+     else
+     {
+      if (!(servermodWin))
+      {
+D(bug("[AiRcOS](showServerConnect) Failed to create server edit window..\n"));
+      }
+      else MUI_DisposeObject(servermodWin);
+      
+      if (!(tmp_connectWin))
+      {
+D(bug("[AiRcOS](showServerConnect) Failed to create server selection window..\n"));      
+      }
+      else MUI_DisposeObject(tmp_connectWin);
+     }
+
+	return tmp_connectWin;
+}
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+
+#include <proto/exec.h>
+#ifdef __SASC
+#include <proto/socket.h>
+#endif
+#include <clib/alib_protos.h>
+
+#define RECV_BUFSIZE 16384
+
+struct MinList *http_get(const char *host, int port, const char *path);
+struct MinList *dorecv(int s);
+void dumplist(struct MinList *list);
+void freelist(struct MinList *list);
+
+struct datanode
+{
+struct MinNode node;
+int len;
+};
+
+int main(void)
+{
+struct MinList *res;
+
+res = http_get("www.amiga.org", 80, "/");
+if (res)
+{
+dumplist(res);
+freelist(res);
+}
+else
+{
+fprintf(stderr, "http_get failed\n");
+}
+
+return 0;
+}
+
+/*
+FUNCTION
+
+http_get - HTTP GET a location off a web server
+
+struct MinList *http_get(const char *host, int port, const char *path)
+
+INPUT
+
+The http-request must be split into valid components for this function.
+
+host: hostname
+port: port number
+path: the path of object to http get. spaces and special chars should
+be encoded to %<hex>
+
+RESULT
+
+struct MinList *
+
+NULL if error, else list filled with 'struct datanode' nodes. Note
+that the output includes the full header returned by the server, and
+it's left for the caller to parse it (separate header and actual
+data).
+
+NOTE
+
+This function blocks, and it can potentially take hours to complete;
+for example if the file is long, or the connection is very slow.
+*/
+
+struct MinList *http_get(const char *host, int port, const char *path)
+{
+struct MinList *list = NULL;
+int s;
+
+if (host && host[0] && port > 0 && path)
+{
+struct sockaddr_in saddr;
+struct hostent *he;
+
+bzero(&saddr, sizeof(saddr));
+
+he = gethostbyname(host);
+if (he)
+{
+memcpy(&saddr.sin_addr, he->h_addr, he->h_length);
+saddr.sin_family = he->h_addrtype;
+}
+else
+{
+saddr.sin_addr.s_addr = inet_addr(host);
+saddr.sin_family = AF_INET;
+}
+
+if (saddr.sin_addr.s_addr != INADDR_NONE)
+{
+s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+if (s != -1)
+{
+saddr.sin_port = htons(port);
+
+if (connect(s, (struct sockaddr *) &saddr, sizeof(saddr)) != -1)
+{
+const char *fmt = 
+"GET %s HTTP/1.0\r\n"
+"Host: %s\r\n"
+"User-Agent: httpget_test_app/1.0\r\n"
+"\r\n";
+char *req;
+
+if (path[0] == '\0')
+{
+path = "/";
+}
+
+req = malloc(strlen(fmt) +
+strlen(path) - 2 +
+strlen(host) - 2 + 1);
+if (req)
+{
+int reqlen;
+
+sprintf(req, fmt, path, host);
+reqlen = strlen(req);
+
+if (send(s, req, reqlen, 0) == reqlen)
+{
+list = dorecv(s);
+}
+
+free(req);
+}
+
+close(s);
+}
+}
+}
+}
+
+return list;
+}
+
+struct MinList *dorecv(int s)
+{
+struct MinList *list = NULL;
+UBYTE *buf;
+
+buf = malloc(RECV_BUFSIZE);
+if (buf)
+{
+int ok = 0;
+
+for (;;)
+{
+int actual;
+
+actual = recv(s, buf, RECV_BUFSIZE, 0);
+if (actual == -1)
+{
+/* error */
+break;
+}
+else if (actual == 0)
+{
+/* eof */
+ok = 1;
+break;
+}
+else
+{
+struct datanode *node;
+
+if (!list)
+{
+list = malloc(sizeof(*list));
+if (!list)
+{
+break;
+}
+NewList((struct List *) list);
+}
+
+node = malloc(sizeof(*node) + actual);
+if (!node)
+{
+break;
+}
+node->len = actual;
+memcpy(node + 1, buf, actual);
+
+AddTail((struct List *) list, (struct Node *) node);
+}
+}
+
+if (!ok)
+{
+freelist(list);
+list = NULL;
+}
+
+free(buf);
+}
+
+return list;
+}
+
+void dumplist (struct MinList *list)
+{
+if (list)
+{
+struct datanode *node;
+
+fflush(stdout);
+
+for (node = (APTR) list->mlh_Head;
+node->node.mln_Succ;
+node = (APTR) node->node.mln_Succ)
+{
+write(STDOUT_FILENO, node + 1, node->len);
+}
+
+fflush(stdout);
+}
+}
+
+void freelist (struct MinList *list)
+{
+if (list)
+{
+struct datanode *node, *nextnode;
+
+for (node = (APTR) list->mlh_Head;
+(nextnode = (APTR) node->node.mln_Succ);
+node = nextnode)
+{
+free(node);
+}
+
+free(list);
+}
+}
+
+/*
+Copyright (C) 2008-2009 Mark Olsen
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+*/
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <errno.h>
+
+#ifdef __MORPHOS__
+#include <sys/filio.h>
+#elif defined(AROS)
+#include <sys/ioctl.h>
+#endif
+
+#include <devices/timer.h>
+
+#include <proto/exec.h>
+#include <proto/socket.h>
+
+#include <string.h>
+
+#include "quakedef.h"
+#include "sys_net.h"
+
+struct SysSocket
+{
+	int s;
+};
+
+struct SysNetData
+{
+	struct Library *SocketBase;
+	struct MsgPort *timerport;
+	struct timerequest *timerrequest;
+};
+
+#define SocketBase netdata->SocketBase
+
+struct SysNetData *Sys_Net_Init()
+{
+	struct SysNetData *netdata;
+
+	netdata = AllocVec(sizeof(*netdata), MEMF_ANY);
+	if (netdata)
+	{
+		SocketBase = OpenLibrary("bsdsocket.library", 0);
+		if (SocketBase)
+		{
+			netdata->timerport = CreateMsgPort();
+			if (netdata->timerport)
+			{
+				netdata->timerrequest = (struct timerequest *)CreateIORequest(netdata->timerport, sizeof(*netdata->timerrequest));
+				if (netdata->timerrequest)
+				{
+					if (OpenDevice(TIMERNAME, UNIT_MICROHZ, (struct IORequest *)netdata->timerrequest, 0) == 0)
+					{
+						netdata->timerrequest->tr_node.io_Command = TR_ADDREQUEST;
+						netdata->timerrequest->tr_time.tv_secs = 1;
+						netdata->timerrequest->tr_time.tv_micro = 0;
+						SendIO((struct IORequest *)netdata->timerrequest);
+						AbortIO((struct IORequest *)netdata->timerrequest);
+
+						return netdata;
+					}
+
+					DeleteIORequest((struct IORequest *)netdata->timerrequest);
+				}
+
+				DeleteMsgPort(netdata->timerport);
+			}
+
+			CloseLibrary(SocketBase);
+		}
+
+		FreeVec(netdata);
+	}
+
+	return 0;
+}
+
+void Sys_Net_Shutdown(struct SysNetData *netdata)
+{
+	WaitIO((struct IORequest *)netdata->timerrequest);
+	CloseDevice((struct IORequest *)netdata->timerrequest);
+	DeleteIORequest((struct IORequest *)netdata->timerrequest);
+	DeleteMsgPort(netdata->timerport);
+	CloseLibrary(SocketBase);
+	FreeVec(netdata);
+}
+
+qboolean Sys_Net_ResolveName(struct SysNetData *netdata, const char *name, struct netaddr *address)
+{
+	struct hostent *remote;
+
+	remote = gethostbyname(name);
+	if (remote)
+	{
+		address->type = NA_IPV4;
+		*(unsigned int *)address->addr.ipv4.address = *(unsigned int *)remote->h_addr;
+
+		return true;
+	}
+
+	return false;
+}
+
+qboolean Sys_Net_ResolveAddress(struct SysNetData *netdata, const struct netaddr *address, char *output, unsigned int outputsize)
+{
+	struct hostent *remote;
+	struct in_addr addr;
+
+	if (address->type != NA_IPV4)
+		return false;
+
+	addr.s_addr = (address->addr.ipv4.address[0]<<24)|(address->addr.ipv4.address[1]<<16)|(address->addr.ipv4.address[2]<<8)|address->addr.ipv4.address[3];
+
+	remote = gethostbyaddr((void *)&addr, sizeof(addr), AF_INET);
+	if (remote)
+	{
+		strlcpy(output, remote->h_name, outputsize);
+
+		return true;
+	}
+
+	return false;
+}
+
+struct SysSocket *Sys_Net_CreateSocket(struct SysNetData *netdata, enum netaddrtype addrtype)
+{
+	struct SysSocket *s;
+	int r;
+	int one;
+
+	one = 1;
+
+	if (addrtype != NA_IPV4)
+		return 0;
+
+	s = AllocVec(sizeof(*s), MEMF_ANY);
+	if (s)
+	{
+		s->s = socket(AF_INET, SOCK_DGRAM, 0);
+		if (s->s != -1)
+		{
+			r = IoctlSocket(s->s, FIONBIO, (void *)&one);
+			if (r == 0)
+			{
+				return s;
+			}
+
+			CloseSocket(s->s);
+		}
+
+		FreeVec(s);
+	}
+
+	return 0;
+}
+
+void Sys_Net_DeleteSocket(struct SysNetData *netdata, struct SysSocket *socket)
+{
+	CloseSocket(socket->s);
+	FreeVec(socket);
+}
+
+qboolean Sys_Net_Bind(struct SysNetData *netdata, struct SysSocket *socket, unsigned short port)
+{
+	int r;
+	struct sockaddr_in addr;
+
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	*(unsigned int *)&addr.sin_addr.s_addr = 0;
+
+	r = bind(socket->s, (struct sockaddr *)&addr, sizeof(addr));
+	if (r == 0)
+		return true;
+
+	return false;
+}
+
+int Sys_Net_Send(struct SysNetData *netdata, struct SysSocket *socket, const void *data, int datalen, const struct netaddr *address)
+{
+	int r;
+
+	if (address)
+	{
+		struct sockaddr_in addr;
+
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(address->addr.ipv4.port);
+		*(unsigned int *)&addr.sin_addr.s_addr = *(unsigned int *)address->addr.ipv4.address;
+
+		r = sendto(socket->s, data, datalen, 0, (struct sockaddr *)&addr, sizeof(addr));
+	}
+	else
+		r = send(socket->s, data, datalen, 0);
+
+	if (r == -1)
+	{
+		if (Errno() == EWOULDBLOCK)
+			return 0;
+	}
+
+	return r;
+}
+
+int Sys_Net_Receive(struct SysNetData *netdata, struct SysSocket *socket, void *data, int datalen, struct netaddr *address)
+{
+	int r;
+
+	if (address)
+	{
+		LONG fromlen;
+		struct sockaddr_in addr;
+
+		fromlen = sizeof(addr);
+
+		r = recvfrom(socket->s, data, datalen, 0, (struct sockaddr *)&addr, &fromlen);
+
+		if (fromlen != sizeof(addr))
+			return -1;
+
+		address->type = NA_IPV4;
+		address->addr.ipv4.port = htons(addr.sin_port);
+		*(unsigned int *)address->addr.ipv4.address = *(unsigned int *)&addr.sin_addr.s_addr;
+	}
+	else
+		r = recv(socket->s, data, datalen, 0);
+
+	if (r == -1)
+	{
+		if (Errno() == EWOULDBLOCK)
+			return 0;
+	}
+
+	return r;
+}
+
+void Sys_Net_Wait(struct SysNetData *netdata, struct SysSocket *socket, unsigned int timeout_us)
+{
+	fd_set rfds;
+	ULONG sigmask;
+
+	WaitIO((struct IORequest *)netdata->timerrequest);
+
+	if (SetSignal(0, 0) & (1<<netdata->timerport->mp_SigBit))
+		Wait(1<<netdata->timerport->mp_SigBit);
+
+	FD_ZERO(&rfds);
+	FD_SET(socket->s, &rfds);
+
+	netdata->timerrequest->tr_node.io_Command = TR_ADDREQUEST;
+	netdata->timerrequest->tr_time.tv_secs = timeout_us / 1000000;
+	netdata->timerrequest->tr_time.tv_micro = timeout_us % 1000000;
+
+	SendIO((struct IORequest *)netdata->timerrequest);
+
+	sigmask = 1<<netdata->timerport->mp_SigBit;
+
+	WaitSelect(socket->s + 1, &rfds, 0, 0, 0, &sigmask);
+
+	AbortIO((struct IORequest *)netdata->timerrequest);
+
+}
+
+Future
+
+The first is about breaking some api level functionality to make way for supporting IPv6. Would it be a great deal to fix the existing functions that assume IPv4 addresses, so they take generic structures instead? miami.library provides the missing API. Miami was going the same way back then. IPv6 looks like a failed experiment. No one seriously deploys it. In fact, not much needs to be replaced. It affects mainly resolver, introducing inet_PtoN() and inet_NtoP(). The rest is perfectly handled by existing socket API. Just add AF_INET6.
+
+How big a task would it be to replace the existing bsd-based internals of AROSTCP with more up to date code? Take recent NetBSD and you're done. FreeBSD diverted a lot. This provides working sysctl and BPF/PCAP. AROSTCP already has some upgraded code. Its codebase is NetBSD v2.0.5. BTW, userland (like resolver) from FreeBSD perfectly fits in. One more idea: separate protocols into loadable modules. This would give you AF_UNIX, AF_BT, etc. There is a single-linked list where all protocols are registered. Nodes are searched using AF_xxx as a key. Then there are several pointers to functions. That's all. This is separable. In the end you would have protocol modules with these functions exported, and something like bsdcore.library, implementing basic low-level stuff like mbufs and bsd_malloc(). There is remaining (IIRC) from original BSD4.3, where AF_xxx are indexes into array. I kept this. So, for now both lookup mechanisms are coexisting. Discard the old one, use NetBSD code as a reference. In fact BSD is very modular at source code level, the same as Linux. You can switch on and off any part without affecting others. So, porting the code isn't difficult.
+
+Would like to propose a 'unified file descriptor' model for arosc.library, to simplify porting of POSIX applications. The goal is to be able to use the same 'int fd' type to represent both the DOS BPTR filehandles and bsdsocket.library socket back-end. This will eliminate the need to rewrite code to use send() instead of write() to sockets, and call CloseSocket() instead of close() for sockets.
+
+Implementation would be as a table (indexed by fd #) that would have the following struct:
+
+struct arosc_fd {
+  APTR file;
+  struct arosc_fd_operation {
+
+      /* Required for all FDs
+        */
+      int (*close)(APTR file);
+      LONG (*sigmask)(APTR file); /* Gets the IO signal mask for poll(2)ing */
+      ssize_t (*write)(APTR file, const void *buff, size_t len);
+      ssize_t (*read)(APTR file, void *buff, size_t len);
+      ..etc etc...
+
+      /* The following are optional operations
+        */
+      off_t (*lseek)(APTR file, off_t offset, int whence);
+      ssize_t (*sendto)(APTR file, const void *buff, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen);
+      ssize_t (*recvfrom)(APTR file, void *buff, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen);
+      ssize_t (*sendmsg)(APTR file, const struct msghdr *msg, int flags);
+      ssize_t (*recvmsg)(APTR file, struct msghdr *msg, int flags);
+      ..etc etc..
+  } *op;
+} *fd_table;
+
+The C library routines 'open()' and 'socket()' would be modified to:
+
+    Ensure that either dos.library or bsdsocket.library is opened.
+    Allocate a new fd in the FD table
+    Set fd_table[fd].ops to a 'struct arosc_fd_operation' pointer, that defines the IO operations for either dos.library for bsdsocket.library
+    Set fd_table[fd].file to a pointer to the private data for those operation (i.e. BPTR or socket fd #)
+    Return the new FD number
+
+The read()/write()/etc. would be modified to use the fd_table[fd].op routines to perform IO
+
+The poll() routine will wait for activity on the OR of all the signal masks of the provided FDs.
+
+The close() routine also deallocates the arosc_fd entry
+
+It's a layer on top of it. bsdsocket.library would be opened dynamically from arosc.library's socket() routine if needed.
+
+Since arosc generated FD's will be different from bsdsocket.library ones how will programmers know what to pass to functions? Programmers would not use the bsdsocket headers nor protos directly (similar arosc.library headers would be generated that wrap them). The point is that programmers would no longer need to treat bsdsocket fd as a special case.
+
+the whole fd_table[] mapping concept. The 'file' element of the fd_table[n] would be a BPTR for an open()ed fd, and a bsdsocket.library socket descriptor number for one created by arosc's socket() call. The user would *not* be calling bsdsocket.library directly under the proposed scheme. Everything in that library would be wrapped by arosc.library.
+
+make sure that those codes will continue using bsdsocket functions and won't switch half arosc / half bsdsocket (for example arosc->send and bsdsocket->CloseLibrary). The 'best' solution would be to have a compilation flag (i.e.
+
+'#define BSDSOCKET_API') that ifdefs out the arosc send()/recv()/socket()/etc prototypes and makes send()/recv()/CloseSocket() and friends from the bsdsocket protos visible.
+
+If BSDSOCKET_API is not defined, but bsdsocket.library is intended (i.e. calls to CloseSocket(), etc.), then the user will get compilation errors about missing function prototypes. If BSDSOCKET_API is defined, but POSIX is intended, then they will get a link error about 'undefined symbol SocketLibrary'
+
+Maybe the bsdsocket includes should also have some detection of arosc includes and produce the warning about the BSDSOCKET_API define being accessible to developers if both headers are included in the same compilation unit - I'm just wondering how we are going to get the word out to third-party developers that they don't have to change their codes and can simply use the define - or maybe it should be the other way around? bsdsocket by default and POSIX_SOCKET_API define to enable the support you mention?
+
+As for the stubs/monkey wrenching, this won't fly due to how the bsdsocket.library architecture works out. Each time you open the library, it creates state information specific to the opener. This state information ties into the original BSD kernel's process data structure. It's fundamentally unsound to even try patching that.
+References
+
+d   domain
+t   type
+p   protocol
+n   name
+nl  namelen
+l   level
+r   request
+a   arg
+o   optname
+ov  optval
+ol  optlen
+m   msg
+l   length
+f   flags
+
+socket(d,t,p)               ex. s=socket(domain, type, protocol)
+bind(s,n,nl)                ex. success = bind(s, name, namelen)
+listen(s,b)
+accept(s,a,al)
+connect(s,n,nl)             ex. success = connect(s, name, namelen)
+sendto(s,m,l,f,t,tl)
+send(s,m,l,f)               ex. nbytes = send(s, msg, len, flags)
+recvfrom(s,b,l,f,fr,frl)
+recv(s,b,l,f)
+shutdown(s,h)
+setsockopt(s,l,o,ov,ol)
+getsockopt(s,l,o,ov,ol)     ex. success =  getsockopt(s, level, optname, optval, optlen)
+getsockname(s,h,n)
+getpeername(s,h,n)
+IoctlSocket(d,r,a)          ex. value = IoctlSocket(fd, request, arg)
+CloseSocket(d)
+WaitSelect(n,r,w,e,t,m)
+SetSocketSignals(sin,sio,su)
+getdtablesize()
+ObtainSocket(i,d,t,p)
+ReleaseSocket(f,i)
+ReleaseCopyOfSocket(f,i)
+Errno()
+SetErrnoPtr(e,s)
+
+d   domain
+t   type
+p   protocol
+n   name
+nl  namelen
+l   level
+r   request
+a   arg
+o   optname
+ov  optval
+ol  optlen
+m   msg
+l   length
+f   flags
+
+Inet_NtoA(i)
+inet_addr(c)                ex. addr = inet_addr(cp)
+Inet_LnaOf(i)
+Inet_NetOf(i)
+Inet_MakeAddr(n,h)
+inet_network(c)
+gethostbyname(n)
+gethostbyaddr(a,l,t)
+getnetbyname(n)
+getnetbyaddr(n,t)
+getservbyname(n,p)
+getservbyport(p,pr)
+getprotobyname(n)
+getprotobynumber(p)
+vsyslog(l,f,a)
+Dup2Socket(fa,fb)
+sendmsg(s,m,f)
+recvmsg(s,m,f)
+gethostname(h,s)
+gethostid()
+SocketBaseTagList(t)
+GetSocketEvents(e)
+getnetent(),                ex. struct netent *getnetent(void);
+getprotoent(),              ex. struct protoent *getprotoent(void);
+getservent(),               ex. struct servent *getservent(void);
+
+the following tags are supported:
+
+SBTC_BREAKMASK
+SBTC_ERRNO
+SBTC_HERRNO
+SBTC_ERRNOSTRPTR
+SBTC_HERRNOSTRPTR
+SBTC_ERRNOBYTEPTR
+SBTC_ERRNOWORDPTR
+SBTC_ERRNOLONGPTR
+SBTC_HERRNOLONGPTR
+SBTC_SIGEVENTMASK
+
+IoctlSocket(x, FIONBIO, x) calls include SIOCSIFADDR, SIOCSIFDSTADDR, SIOCSIFBRDADDR, SIOCGIFADDR, SIOCGIFDSTADDR, SIOCGIFBRDADDR, SIOCSIFFLAGS, SIOCGIFFLAGS, SIOCSIFMETRIC, and SIOCGIFMETRIC 
+
+#ifndef AMITCP_SOCKETBASETAGS_H
+#define AMITCP_SOCKETBASETAGS_H
+/*
+    Copyright � 2003-2004, The AROS Development Team. All rights reserved.
+    $Id$
+*/
+
+#ifndef UTILITY_TAGITEM_H
+#include <utility/tagitem.h>
+#endif
+
+/*
+ * utility/tagitem.h specifies that bits 16-30 in tags are reserved. So we 
+ * don't use them for maximum compatibility.
+ */
+
+/*
+ * Argument passing convention (bit 15)
+ */
+#define SBTF_REF 0x8000		/* 0x0000 == VAL */
+
+/*
+ * Code (bits 1-14)
+ */
+#define SBTB_CODE 1
+#define SBTS_CODE 0x3FFF
+#define SBTM_CODE(tag) (((UWORD)(tag) >> SBTB_CODE) & SBTS_CODE)
+
+/* 
+ * Direction (bit 0)
+ */
+#define SBTF_SET  0x1		/* 0 == GET */
+
+/*
+ * Macros to set things up
+ * We keep the TAG_USER (bit 31) set to be compatible with tagitem.h
+ * conventions.
+ */
+#define SBTM_GETREF(code) \
+  (TAG_USER | SBTF_REF | (((code) & SBTS_CODE) << SBTB_CODE))
+#define SBTM_GETVAL(code) \
+  (TAG_USER | (((code) & SBTS_CODE) << SBTB_CODE))
+#define SBTM_SETREF(code) \
+  (TAG_USER | SBTF_REF | (((code) & SBTS_CODE) << SBTB_CODE) | SBTF_SET)
+#define SBTM_SETVAL(code) \
+  (TAG_USER | (((code) & SBTS_CODE) << SBTB_CODE) | SBTF_SET)
+
+/*
+ * Tag code definitions. These codes are used with one of the above macros.
+ *
+ * All arguments are ULONG's or pointers (PTR suffix).
+ *
+ * NOTE: Tag code 0 is not used (see utility/tagitem.h).
+ */
+
+/* signal masks */
+#define SBTC_BREAKMASK		1
+#define SBTC_SIGIOMASK		2
+#define SBTC_SIGURGMASK		3
+#define SBTC_SIGEVENTMASK	4 /* V 4.0 addition */
+
+/* error code handling */
+#define SBTC_ERRNO		6
+#define SBTC_HERRNO		7
+
+/* socket descriptor table related tags */
+#define SBTC_DTABLESIZE         8
+
+/* link library fd allocation callback
+ * 
+ * Argument is a callback function with following prototype
+ *
+ * int fd = fdCallback(int fd, int action);
+ *     D0                  D0      D1
+ *
+ * see net.lib sources for an example
+ */
+#define SBTC_FDCALLBACK         9
+/*
+ * "action" values:
+ */
+#define FDCB_FREE  0
+#define FDCB_ALLOC 1
+#define FDCB_CHECK 2
+
+/* syslog variables (see netinclude:sys/syslog.h for values) */
+#define SBTC_LOGSTAT		10
+#define SBTC_LOGTAGPTR		11
+#define SBTC_LOGFACILITY	12
+#define SBTC_LOGMASK		13
+
+/*
+ * The argument of following error string tags is a ULONG,
+ * where the error number is stored. On return the string pointer is 
+ * returned on this same ULONG. (GET ONLY)
+ *
+ * NOTE: error numbers defined in <exec/errors.h> are negative and must be
+ * negated (turned to positive) before passing to the SocketBaseTagList().
+ */
+#define SBTC_ERRNOSTRPTR	14 /* <sys/errno.h> */
+#define SBTC_HERRNOSTRPTR	15 /* <netdb.h> */
+#define SBTC_IOERRNOSTRPTR	16 /* <exec/errors.h> SEE NOTE ABOVE */
+#define SBTC_S2ERRNOSTRPTR	17 /* <devices/sana2.h> */
+#define SBTC_S2WERRNOSTRPTR	18 /* <devices/sana2.h> */
+
+/* errno pointer & size SETTING (only) */
+#define SBTC_ERRNOBYTEPTR	21
+#define SBTC_ERRNOWORDPTR	22
+#define SBTC_ERRNOLONGPTR	24
+/*
+ * Macro for generating the errnoptr tag code from a (constant) size.
+ * only 1,2 & 4 are legal 'size' values. If the 'size' value is illegal,
+ * the tag is set to 0, which causes SocketBaseTagList() to fail.
+ */
+#define SBTC_ERRNOPTR(size)    ((size == sizeof(long)) ? SBTC_ERRNOLONGPTR   :\
+				((size == sizeof(short)) ? SBTC_ERRNOWORDPTR :\
+				 ((size == sizeof(char)) ? SBTC_ERRNOBYTEPTR :\
+				  0)))
+
+/* h_errno pointer */
+#define SBTC_HERRNOLONGPTR	25
+
+/* release string pointer (read only!) */
+#define SBTC_RELEASESTRPTR	29
+
+#ifdef notyet
+/*
+ * Different boolean variables
+ */
+/* use 4.3BSD compatible sockaddr structures */
+#define SBTC_COMPAT43           30 
+#endif
+
+#endif /* !AMITCP_SOCKETBASETAGS_H */
+
+socket—create an endpoint for communication
+
+SYNOPSIS[edit]
+
+    #include <sys/types.h>
+    #include <sys/socket.h>
+
+    int socket(int domain, int type, int protocol)
+
+DESCRIPTION[edit]
+
+   Socket() creates an endpoint for communication and returns a
+   descriptor.
+
+   The domain parameter specifies a communications domain within which
+   communication will take place; this selects the protocol family
+   which should be used. These families are defined in the include
+   file <sys/socket.h>. The currently understood formats are
+
+        AF_UNIX         (UNIX internal protocols),
+        AF_INET         (ARPA Internet protocols),
+        AF_ISO          (ISO protocols),
+        AF_NS           (Xerox Network Systems protocols), and
+        AF_IMPLINK      (IMP ``host at IMP link layer).
+
+   AROS AMITCP/IP currently supports only AF_INET protocol family.
+
+   The socket has the indicated type, which specifies the semantics of
+   communication. Currently defined types are:
+
+        SOCK_STREAM
+        SOCK_DGRAM
+        SOCK_RAW
+        SOCK_SEQPACKET
+        SOCK_RDM
+
+   A SOCK_STREAM type provides sequenced, reliable, two-way connection
+   based byte streams. An out-of-band data transmission mechanism
+   may be supported. A SOCK_DGRAM socket supports datagrams
+   (connectionless, unreliable messages of a fixed (typically small)
+   maximum length). A SOCK_SEQPACKET socket may provide a sequenced,
+   reliable, two-way connection-based data transmission path for
+   datagrams of fixed maximum length; a consumer may be required to
+   read an entire packet with each read system call. This facility
+   is protocol-specific, and presently implemented only for PF_NS.
+   SOCK_RAW sockets provide access to internal network protocols
+   and interfaces. The types SOCK_RAW, which is available only to
+   the super-user, and SOCK_RDM, which is planned, but not yet
+   implemented, are not described here.
+
+   The protocol specifies a particular protocol to be used with the
+   socket. Normally only a single protocol exists to support a
+   particular socket-type within a given protocol family. However,
+   it is possible that many protocols may exist, in which case a
+   particular protocol must be specified in this manner. The
+   protocol number to use is particular to the "communication domain"
+   in which communication is to take place.
+
+   Sockets of type SOCK_STREAM are full-duplex byte streams, similar
+   to pipes. A stream socket must be in a connected state before any
+   data may be sent or received on it. A connection to another
+   socket is created with a connect() call. Once connected, data may
+   be transferred using recv() and send() or their variant calls.
+   When a session has been completed a CloseSocket() may be
+   performed. Out-of-band data may also be transmitted as described
+   in send() and received as described in recv().
+
+   The communications protocols used to implement a SOCK_STREAM insure
+   that data is not lost or duplicated. If a piece of data for which
+   the peer protocol has buffer space cannot be successfully
+   transmitted within a reasonable length of time, then the
+   connection is considered broken and calls will indicate an error
+   with -1 returns and with ETIMEDOUT as the specific error code (see
+   Errno()). The protocols optionally keep sockets "warm" by forcing
+   transmissions roughly every minute in the absence of other
+   activity. An error is then indicated if no response can be
+   elicited on an otherwise idle connection for an extended period
+   (e.g. 5 minutes).
+
+   SOCK_SEQPACKET sockets employ the same system calls as SOCK_STREAM
+   sockets. The only difference is that recv() calls will return
+   only the amount of data requested, and any remaining in the
+   arriving packet will be discarded.
+
+   SOCK_DGRAM and SOCK_RAW sockets allow sending of datagrams to
+   correspondents named in send() calls. Datagrams are generally
+   received with recvfrom(), which returns the next datagram with its
+   return address.
+
+   An IoctlSocket() call can be used to specify a task to receive a
+   SIGURG signal when the out-of-band data arrives. It may also
+   enable non-blocking I/O and asynchronous notification of I/O events
+   via SIGIO.
+
+   The operation of sockets is controlled by socket-level options.
+   These options are defined in the file <sys/socket.h>.
+   setsockopt() and getsockopt() are used to set and get
+   options, respectively.
+
+RETURN VALUES[edit]
+
+   A -1 is returned if an error occurs, otherwise the return value is
+   a descriptor referencing the socket.
+
+ERRORS[edit]
+
+   The socket() call fails if:
+  [EPROTONOSUPPORT]
+        The protocol type or the specified protocol is not supported
+        within this domain.
+
+  [EMFILE]
+        The per-process descriptor table is full.
+
+  [EACCESS]
+        Permission to create a socket of the specified type and/or
+        protocol is denied.
+
+  [ENOBUFS]
+        Insufficient buffer space is available. The socket cannot be
+        created until sufficient resources are freed.
+
+NOTES[edit]
+
+   socket() calls the fdCallback() with action codes FDCB_CHECK and
+   FDCB_ALLOC to check and mark the new descriptor as allocated
+   if the callback is defined. See SocketBaseTagList() for more
+   information on fdCallback().
+
+TagList[edit] SocketBaseTagList—Set/Get SocketBase attributes.
+
+SYNOPSIS[edit]
+
+   #include <amitcp/socketbasetags.h>
+
+   ULONG SocketBaseTagList(struct TagItem * taglist);
+
+   ULONG SocketBaseTags(ULONG tag, ...);
+
+FUNCTION[edit]
+
+   Set or get a list of (mostly) SocketBase instance dependent
+   attributes from the AMITCP/IP.
+
+INPUTS[edit]
+
+   These functions expect as their argument a standard tag list, one
+   or several array of struct TagItem as defined in the header file
+   <utility/tagitem.h>. The structure contains two fields: ti_Tag
+   and ti_Data. The ti_Tag field contains tag code, which determines
+   what the SocketBaseTagList() should do with its argument, the
+   ti_Data field.
+
+   The include file <amitcp/socketbasetags.h> defines macros for base
+   tag code values. Base tag code macros begin with `SBTC_' (as
+   Socket Base Tag Code). The base tag value defines what data item
+   the tag item refers.
+
+   The tag code contains other information besides the referred data
+   item. It controls, whether the SocketBaseTagList() should set or
+   get the appropriate parameter, and whether the argument of the tag
+   in question is passed by value or by reference.
+
+   The include file <amitcp/socketbasetags.h> defines the following
+   macros, which are used to construct the ti_Tag values from the base
+   tag codes:
+        SBTM_GETREF(code) - get by reference
+        SBTM_GETVAL(code) - get by value
+        SBTM_SETREF(code) - set by reference
+        SBTM_SETVAL(code) - set by value
+
+   If the actual data is stored directly into the ti_Data field, you
+   should use the 'by value' macros, SBTM_GETVAL() or SBTM_SETVAL().
+   However, if the ti_Data field contains a pointer to actual data,
+   you should use the 'by reference' macros, SBTM_GETREF() or
+   SBTM_SETREF(). In either case the actual data should always
+   be a LONG aligned to even address.
+
+   According the used tag naming scheme a tag which has "PTR" suffix
+   takes an pointer as its argument. Don't mix the pointer arguments
+   with 'by reference' argument passing. It is possible to pass a
+   pointer by reference (in which case the ti_Data is a pointer to
+   the actual pointer).
+
+   The list of all defined base tag codes is as follows:
+
+  SBTC_BREAKMASK
+        Tag data contains the INTR signal mask. If the calling task
+        receives a signal in the INTR mask, the AMITCP/IP interrupts
+        current function calls and returns with the error code EINTR.
+        The INTR mask defaults to the CTRL-C signal (SIGBREAKF_C,
+        bit 12).
+
+  SBTC_DTABLESIZE
+        Socket Descriptor Table size. This defaults to 64.
+
+  SBTC_ERRNO
+        The errno value. The values are defined in <sys-errno.h>.
+
+  SBTC_ERRNOBYTEPTR
+  SBTC_ERRNOWORDPTR
+  SBTC_ERRNOLONGPTR
+  SBTC_ERRNOPTR(size)
+        Set (only) the pointer to the errno variable defined by the
+        program.  AMITCP/IP defines a value for this by default, but
+        the application must set the pointer (and the size of the
+        errno) with one of these tags, if it wishes to access the
+        errno variable directly.
+
+        The SBTC_ERRNOPTR(size) is a macro, which expands to one of
+        the other (BYTE, WORD or LONG) tag codes, meaning that only
+        1, 2 and 4 are legal size values.
+
+        The NetLib:autoinit.c sets the errno pointer for the
+        application, if the application is linked with it.
+
+  SBTC_ERRNOSTRPTR
+        Returns an error string pointer describing the errno value
+        given on input. You can not set the error message, only get
+        is allowed.
+
+        On call the ti_Data must contain the error code number. On
+        return the ti_Data is assigned to the string pointer.
+        (*ti_Data, if passed by reference). See the file
+        <sys-errno.h> for symbolic definitions for the errno codes.
+
+  SBTC_FDCALLBACK
+        A callback function pointer for coordination of file
+        descriptor usage between AMITCP/IP and link-library. By
+        default no callback is called and the value of this pointer
+        is NULL. The prototype for the callback function is:
+
+        int error = fdCallback(int fd, int action);
+
+       where
+       error
+             - 0 for success or one of the error codes in
+             <sys-errno.h> in case of error. The AMITCP/IP API
+             function that calls the callback usually returns the
+             error back to the caller without any further
+             modification.
+
+       fd
+             - file descriptor number to take action on.
+
+       action
+             - one of the action codes, which are defined in the
+             header file <amitcp-socketbasetags.h>) as follows:
+
+            FDCB_FREE
+                  - mark the fd as unused on the link library
+                  structure. If fd represents a file handled by the
+                  link library, the error ENOTSOCK should be returned.
+
+            FDCB_ALLOC
+                  - mark the fd allocated as a socket.
+
+            FDCB_CHECK
+                  -check if the fd is free. If an error is returned,
+                  the fd is marked as used in the AMITCP/IP
+                  structures.
+
+        The AMITCP/IP calls the callback every time a socket
+        descriptor is allocated or freed. AMITCP/IP uses the
+        FDCB_CHECK before actual allocation to check that it
+        agrees with the link library on the next free descriptor
+        number. Thus the link library doesn't need to tell the
+        AMITCP/IP if it creates a new file handle in open(), for
+        example.
+
+        See file _chkufb.c on the net.lib sources for an example
+        implementation of the callback function for the SAS/C.
+
+  SBTC_HERRNO
+        The name resolver error code value. Get this to find out why
+        the gethostbyname() or gethostbyaddr() failed. The values are
+        defined in <netdb.h>.
+
+  SBTC_HERRNOSTRPTR
+        Returns host error string for error number in tag data. Host
+        error is set on unsuccessful gethostbyname() and
+        gethostbyaddr() calls. See the file <netdb.h> for the
+        symbolic definitions for the herrno valus.
+
+        Notes for the SBTC_ERRNOSTRPTR apply also to this tag code.
+
+  SBTC_IOERRNOSTRPTR
+        Returns an error string for standard AmigaOS I/O error number
+        as defined in the header file <exec-errors.h>. Note that the
+        error number taken by this tag code is positive, so the error
+        codes must be negated (to be positive). The positive error
+        codes depend on the particular IO device, the standard
+        Sana-II error codes can be retrieved by the tag code
+        SBTC_S2ERRNOSTRPTR.
+
+        Notes for the SBTC_ERRNOSTRPTR apply also to this tag code.
+
+  SBTC_LOGFACILITY
+        Facility code for the syslog messages as defined in
+        <sys/syslog.h>. Defaults to LOG_USER.
+
+  SBTC_LOGMASK
+        Sets the filter mask of the syslog messages. By default the
+        mask is 0xff, meaning that all messages are passed to the log
+        system.
+
+  SBTC_LOGSTAT
+        Syslog options defined in <sys/syslog.h>.
+
+  SBTC_LOGTAGPTR
+        A pointer to a string which is used by Syslog() to mark
+        individual syslog messages. This defaults to NULL, but is set
+        to the name of the calling program by the autoinit code in
+        netlib:autoinit.c. This is for compatibility with pre-3.0
+        programs.
+
+  SBTC_S2ERRNOSTRPTR
+        Returns an error string for a Sana-II specific I/O error code
+        as defined in the header file <devices-sana2.h>.
+
+        Notes for the SBTC_ERRNOSTRPTR apply also to this tag code.
+
+  SBTC_S2WERRNOSTRPTR
+        Returns an error string for a Sana-II Wire Error code as
+        defined in the header file <devices-sana2.h>.
+
+        Notes for the SBTC_ERRNOSTRPTR apply also to this tag code.
+
+  SBTC_SIGEVENTMASK
+        Tag data contains the signal mask to be sent to the
+        application whenever notification about socket events is in
+        order. The default value for this is zero, inhibiting any
+        event notifications. The application must set this mask if
+        it desires to be notified about asynchronous socket events.
+        When the application receives the signal specified in the
+        mask, it can use the function GetSocketEvents() to find out
+        what happened.
+
+  SBTC_SIGIOMASK
+        The signals specified in the mask in the tag data are sent to
+        the calling task when asynchronous I/O is to be notified. The
+        default value is zero, i.e., no signals are sent. The signals
+        in the mask are sent whenever something happens on the
+        socket. This mechanism is compatible with the Unix SIGIO
+        signal.
+
+        Since AmigaOS signals may get combined, one signal may include
+        notification for originally distinct events on the socket.
+        One example of this is the reception of data and connection
+        closure.
+
+        Usage of the socket events (see GetSocketEvents()) is
+        recommended over this because of the problem described above.
+
+  SBTC_SIGURGMASK
+        The signals specified in the mask in the tag data are sent to
+        the calling task when notification about urgent data arrives.
+        The default value is zero, i.e. no signals are sent. This
+        mechanism is compatible with the Unix SIGURG signal.
+
+        Note that this signal does not indicate the arrival of the
+        actual out-of-band data. If the receive buffer of the socket
+        is full, the urgent data can't even be received. Because of
+        this the application may need to read some normal data off
+        the socket before it can read the urgent data.
+
+RESULT[edit]
+
+   Returns 0 on success, and a (positive) index of the failing tag on
+   error. Note that the value 1 means first TagItem, 2 the second
+   one, and so on. The return value is NOT a C-language index, which
+   are 0 based.
+
+__sys_errlist[] table is wrong because it assumes that error defines/values are those from "sys/errno.h" instead of (in case of AROS) those from "errno.h"
+
+#ifndef _ERRNO_H_
+#define _ERRNO_H_
+
+/*
+    Copyright © 1995-2001, The AROS Development Team. All rights reserved.
+    $Id: errno.h 20107 2003-11-13 09:15:08Z falemagn $
+
+    Desc: ANSI-C header file errno.h
+    Lang: english
+*/
+
+#include <sys/cdefs.h>
+
+#define EPERM		 1	/* Operation not permitted */
+#define ENOENT		 2	/* No such file or directory */
+#define ESRCH		 3	/* No such process */
+#define EINTR		 4	/* Interrupted system call */
+#define EIO		 5	/* I/O error */
+#define ENXIO		 6	/* No such device or address */
+#define E2BIG		 7	/* Arg list too long */
+#define ENOEXEC 	 8	/* Exec format error */
+#define EBADF		 9	/* Bad file number */
+#define ECHILD		10	/* No child processes */
+#define EAGAIN		11	/* Try again */
+#define ENOMEM		12	/* Out of memory */
+#define EACCES		13	/* Permission denied */
+#define EFAULT		14	/* Bad address */
+#define ENOTBLK 	15	/* Block device required */
+#define EBUSY		16	/* Device or resource busy */
+#define EEXIST		17	/* File exists */
+#define EXDEV		18	/* Cross-device link */
+#define ENODEV		19	/* No such device */
+#define ENOTDIR 	20	/* Not a directory */
+#define EISDIR		21	/* Is a directory */
+#define EINVAL		22	/* Invalid argument */
+#define ENFILE		23	/* File table overflow */
+#define EMFILE		24	/* Too many open files */
+#define ENOTTY		25	/* Not a typewriter */
+#define ETXTBSY 	26	/* Text file busy */
+#define EFBIG		27	/* File too large */
+#define ENOSPC		28	/* No space left on device */
+#define ESPIPE		29	/* Illegal seek */
+#define EROFS		30	/* Read-only file system */
+#define EMLINK		31	/* Too many links */
+#define EPIPE		32	/* Broken pipe */
+#define EDOM		33	/* Math argument out of domain of func */
+#define ERANGE		34	/* Math result not representable */
+#define EDEADLK 	35	/* Resource deadlock would occur */
+#define ENAMETOOLONG	36	/* File name too long */
+#define ENOLCK		37	/* No record locks available */
+#define ENOSYS		38	/* Function not implemented */
+#define ENOTEMPTY	39	/* Directory not empty */
+#define ELOOP		40	/* Too many symbolic links encountered */
+#define EWOULDBLOCK	EAGAIN	/* Operation would block */
+#define ENOMSG		42	/* No message of desired type */
+#define EIDRM		43	/* Identifier removed */
+#define ECHRNG		44	/* Channel number out of range */
+#define EL2NSYNC	45	/* Level 2 not synchronized */
+#define EL3HLT		46	/* Level 3 halted */
+#define EL3RST		47	/* Level 3 reset */
+#define ELNRNG		48	/* Link number out of range */
+#define EUNATCH 	49	/* Protocol driver not attached */
+#define ENOCSI		50	/* No CSI structure available */
+#define EL2HLT		51	/* Level 2 halted */
+#define EBADE		52	/* Invalid exchange */
+#define EBADR		53	/* Invalid request descriptor */
+#define EXFULL		54	/* Exchange full */
+#define ENOANO		55	/* No anode */
+#define EBADRQC 	56	/* Invalid request code */
+#define EBADSLT 	57	/* Invalid slot */
+#define EBFONT		59	/* Bad font file format */
+#define ENOSTR		60	/* Device not a stream */
+#define ENODATA 	61	/* No data available */
+#define ETIME		62	/* Timer expired */
+#define ENOSR		63	/* Out of streams resources */
+#define ENONET		64	/* Machine is not on the network */
+#define ENOPKG		65	/* Package not installed */
+#define EREMOTE 	66	/* Object is remote */
+#define ENOLINK 	67	/* Link has been severed */
+#define EADV		68	/* Advertise error */
+#define ESRMNT		69	/* Srmount error */
+#define ECOMM		70	/* Communication error on send */
+#define EPROTO		71	/* Protocol error */
+#define EMULTIHOP	72	/* Multihop attempted */
+#define EDOTDOT 	73	/* RFS specific error */
+#define EBADMSG 	74	/* Not a data message */
+#define EOVERFLOW	75	/* Value too large for defined data type */
+#define ENOTUNIQ	76	/* Name not unique on network */
+#define EBADFD		77	/* File descriptor in bad state */
+#define EREMCHG 	78	/* Remote address changed */
+#define ELIBACC 	79	/* Can not access a needed shared library */
+#define ELIBBAD 	80	/* Accessing a corrupted shared library */
+#define ELIBSCN 	81	/* .lib section in a.out corrupted */
+#define ELIBMAX 	82	/* Attempting to link in too many shared libraries */
+#define ELIBEXEC	83	/* Cannot exec a shared library directly */
+#define EILSEQ		84	/* Illegal byte sequence */
+#define ERESTART	85	/* Interrupted system call should be restarted */
+#define ESTRPIPE	86	/* Streams pipe error */
+#define EUSERS		87	/* Too many users */
+#define ENOTSOCK	88	/* Socket operation on non-socket */
+#define EDESTADDRREQ	89	/* Destination address required */
+#define EMSGSIZE	90	/* Message too long */
+#define EPROTOTYPE	91	/* Protocol wrong type for socket */
+#define ENOPROTOOPT	92	/* Protocol not available */
+#define EPROTONOSUPPORT 93	/* Protocol not supported */
+#define ESOCKTNOSUPPORT 94	/* Socket type not supported */
+#define EOPNOTSUPP	95	/* Operation not supported on transport endpoint */
+#define EPFNOSUPPORT	96	/* Protocol family not supported */
+#define EAFNOSUPPORT	97	/* Address family not supported by protocol */
+#define EADDRINUSE	98	/* Address already in use */
+#define EADDRNOTAVAIL	99	/* Cannot assign requested address */
+#define ENETDOWN	100	/* Network is down */
+#define ENETUNREACH	101	/* Network is unreachable */
+#define ENETRESET	102	/* Network dropped connection because of reset */
+#define ECONNABORTED	103	/* Software caused connection abort */
+#define ECONNRESET	104	/* Connection reset by peer */
+#define ENOBUFS 	105	/* No buffer space available */
+#define EISCONN 	106	/* Transport endpoint is already connected */
+#define ENOTCONN	107	/* Transport endpoint is not connected */
+#define ESHUTDOWN	108	/* Cannot send after transport endpoint shutdown */
+#define ETOOMANYREFS	109	/* Too many references: cannot splice */
+#define ETIMEDOUT	110	/* Connection timed out */
+#define ECONNREFUSED	111	/* Connection refused */
+#define EHOSTDOWN	112	/* Host is down */
+#define EHOSTUNREACH	113	/* No route to host */
+#define EALREADY	114	/* Operation already in progress */
+#define EINPROGRESS	115	/* Operation now in progress */
+#define ESTALE		116	/* Stale NFS file handle */
+#define EUCLEAN 	117	/* Structure needs cleaning */
+#define ENOTNAM 	118	/* Not a XENIX named type file */
+#define ENAVAIL 	119	/* No XENIX semaphores available */
+#define EISNAM		120	/* Is a named type file */
+#define EREMOTEIO	121	/* Remote I/O error */
+#define EDQUOT		122	/* Quota exceeded */
+#define MAX_ERRNO	122	/* Last errno */
+
+#define EDEADLOCK	EDEADLK
+
+#include <sys/arosc.h>
+__pure static __inline__ int *__get_errno_ptr(void);
+__pure static __inline__ int *__get_errno_ptr(void)
+{
+    return &__get_arosc_userdata()->acud_errno;
+}
+#define errno (*__get_errno_ptr())
+
+#endif /* _ERRNO_H_ */

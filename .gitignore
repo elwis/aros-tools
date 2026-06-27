@@ -2,3 +2,4 @@
 *.exe
 build/
 zune-apps/hello/hello
+zune-apps/FTPacket/FTPacket
