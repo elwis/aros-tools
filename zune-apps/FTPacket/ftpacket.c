@@ -43,13 +43,17 @@
  * Constants
  * ================================================================ */
 
-#define FTP_CTRL_BUF  2048
-#define FTP_DATA_BUF  8192
-#define MAX_PATH       512
-#define DIR_PREFIX    "[DIR] "
-#define DIR_PREFIX_LEN 6
-#define VOL_PREFIX    "[VOL] "
-#define VOL_PREFIX_LEN 6
+#define FTP_CTRL_BUF    2048
+#define FTP_DATA_BUF    8192
+#define MAX_PATH         512
+#define DIR_PREFIX      "[DIR] "
+#define DIR_PREFIX_LEN  6
+#define VOL_PREFIX      "[VOL] "
+#define VOL_PREFIX_LEN  6
+/* Offset into a formatted remote file entry where the filename starts.
+ * Format: "%10s %-12s %s"  →  10 (size) + 1 (sp) + 12 (date) + 1 (sp) = 24 */
+#define REMOTE_NAME_OFF 24
+#define PREFS_FILE      "S:FTPacket.prefs"
 
 /* ================================================================
  * Global library bases
@@ -256,6 +260,52 @@ static const char *ftp_entry_name(const char *line)
     return last ? last : line;
 }
 
+/* Advance past n whitespace-delimited tokens (handles multiple spaces). */
+static const char *skip_fields(const char *p, int n)
+{
+    for (int i = 0; i < n; i++) {
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+    }
+    return p;
+}
+
+/*
+ * Turn a raw Unix LIST line into a tidy display string.
+ *   directories  →  "[DIR] name"
+ *   files/links  →  "      size date name"   (REMOTE_NAME_OFF chars of prefix)
+ * Dotfiles and unparseable lines return FALSE and are not shown.
+ */
+static BOOL ftp_format_entry(const char *raw, char *out, int outlen)
+{
+    if (!raw || !raw[0]) return FALSE;
+    if (raw[0] != 'd' && raw[0] != '-' && raw[0] != 'l') return FALSE;
+
+    const char *name = skip_fields(raw, 8);
+    if (!*name || name[0] == '.') return FALSE;
+
+    if (raw[0] == 'd') {
+        snprintf(out, outlen, DIR_PREFIX "%s", name);
+        return TRUE;
+    }
+
+    /* Size: token index 4 */
+    const char *sz = skip_fields(raw, 4);
+    char size[16] = {0}; int si = 0;
+    while (*sz >= '0' && *sz <= '9' && si < 15) size[si++] = *sz++;
+
+    /* Date: tokens 5-7 — from after size up to name pointer, spaces trimmed */
+    const char *dp = skip_fields(raw, 5);
+    int dlen = (int)(name - dp);
+    while (dlen > 0 && dp[dlen - 1] == ' ') dlen--;
+    char datebuf[16] = {0};
+    if (dlen > 15) dlen = 15;
+    strncpy(datebuf, dp, dlen);
+
+    snprintf(out, outlen, "%10s %-12s %s", size, datebuf, name);
+    return TRUE;
+}
+
 /* ================================================================
  * Status helper
  * ================================================================ */
@@ -401,16 +451,17 @@ static void remote_refresh(void)
         CloseSocket(ds); ui_busy(FALSE); ui_status(resp); return;
     }
 
-    /* Read listing, split on newlines, insert each line */
-    char buf[FTP_DATA_BUF]; char line[512]; int lp = 0; int n;
+    /* Read listing, format each line, skip dotfiles */
+    char buf[FTP_DATA_BUF]; char line[600]; char fmtline[640];
+    int lp = 0; int n;
     while ((n = recv_pump(ds, buf, sizeof(buf))) > 0) {
         for (int i = 0; i < n; i++) {
             char c = buf[i];
             if (c == '\n') {
                 line[lp] = '\0'; lp = 0;
-                if (line[0])
+                if (ftp_format_entry(line, fmtline, sizeof(fmtline)))
                     DoMethod(lst_remote, MUIM_List_InsertSingle,
-                             line, MUIV_List_Insert_Bottom);
+                             fmtline, MUIV_List_Insert_Bottom);
             } else if (c != '\r' && lp < (int)sizeof(line)-1) {
                 line[lp++] = c;
             }
@@ -530,9 +581,11 @@ static ULONG do_download(struct Hook *h, Object *obj, APTR msg)
     char *entry = NULL;
     DoMethod(lst_remote, MUIM_List_GetEntry, pos, &entry);
     if (!entry) return 0;
-    if (entry[0] == 'd') { ui_status("Cannot download a directory"); return 0; }
+    if (strncmp(entry, DIR_PREFIX, DIR_PREFIX_LEN) == 0)
+        { ui_status("Cannot download a directory"); return 0; }
 
-    const char *fname = ftp_entry_name(entry);
+    /* Formatted file entry: first REMOTE_NAME_OFF chars are size+date prefix */
+    const char *fname = entry + REMOTE_NAME_OFF;
 
     char resp[256]; ftp_cmd("TYPE I", resp, sizeof(resp));
 
@@ -545,9 +598,9 @@ static ULONG do_download(struct Hook *h, Object *obj, APTR msg)
     char cmd[MAX_PATH*2+8];
     int cwdlen = strlen(g_ftp.cwd);
     if (cwdlen > 0 && g_ftp.cwd[cwdlen-1] == '/')
-        snprintf(cmd, sizeof(cmd), "RETR %s%s", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "RETR \"%s%s\"", g_ftp.cwd, fname);
     else
-        snprintf(cmd, sizeof(cmd), "RETR %s/%s", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "RETR \"%s/%s\"", g_ftp.cwd, fname);
 
     int code = ftp_cmd(cmd, resp, sizeof(resp));
     if (code != 125 && code != 150) {
@@ -620,9 +673,9 @@ static ULONG do_upload(struct Hook *h, Object *obj, APTR msg)
     char cmd[MAX_PATH*2+8];
     int cwdlen = strlen(g_ftp.cwd);
     if (cwdlen > 0 && g_ftp.cwd[cwdlen-1] == '/')
-        snprintf(cmd, sizeof(cmd), "STOR %s%s", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "STOR \"%s%s\"", g_ftp.cwd, fname);
     else
-        snprintf(cmd, sizeof(cmd), "STOR %s/%s", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "STOR \"%s/%s\"", g_ftp.cwd, fname);
 
     int code = ftp_cmd(cmd, resp, sizeof(resp));
     if (code != 125 && code != 150) {
@@ -692,11 +745,12 @@ static ULONG do_remote_dbl(struct Hook *h, Object *obj, APTR msg)
     if ((LONG)pos < 0) return 0;
     char *entry = NULL;
     DoMethod(lst_remote, MUIM_List_GetEntry, pos, &entry);
-    if (!entry || entry[0] != 'd') return 0;
+    if (!entry || strncmp(entry, DIR_PREFIX, DIR_PREFIX_LEN) != 0) return 0;
 
-    const char *dname = ftp_entry_name(entry);
-    char cmd[MAX_PATH+8]; char resp[256];
-    snprintf(cmd, sizeof(cmd), "CWD %s", dname);
+    /* Name starts right after "[DIR] "; may contain spaces */
+    const char *dname = entry + DIR_PREFIX_LEN;
+    char cmd[MAX_PATH+16]; char resp[256];
+    snprintf(cmd, sizeof(cmd), "CWD \"%s\"", dname);
     if (ftp_cmd(cmd, resp, sizeof(resp)) == 250) {
         ftp_update_cwd();
         remote_refresh();
@@ -704,6 +758,51 @@ static ULONG do_remote_dbl(struct Hook *h, Object *obj, APTR msg)
         ui_status(resp);
     }
     return 0;
+}
+
+/* ================================================================
+ * Preferences (S:FTPacket.prefs)  — host, port, user only (not password)
+ * ================================================================ */
+
+static void save_prefs(void)
+{
+    STRPTR host = NULL, user = NULL; IPTR port = 21;
+    get(str_host, MUIA_String_Contents, &host);
+    get(str_port, MUIA_String_Integer,  &port);
+    get(str_user, MUIA_String_Contents, &user);
+
+    BPTR fh = Open(PREFS_FILE, MODE_NEWFILE);
+    if (!fh) return;
+    char buf[320];
+    snprintf(buf, sizeof(buf), "host=%s\nport=%lu\nuser=%s\n",
+             host ? host : "", (ULONG)port, user ? user : "");
+    Write(fh, buf, strlen(buf));
+    Close(fh);
+}
+
+static void load_prefs(void)
+{
+    BPTR fh = Open(PREFS_FILE, MODE_OLDFILE);
+    if (!fh) return;
+    char buf[320]; LONG n = Read(fh, buf, sizeof(buf) - 1);
+    Close(fh);
+    if (n <= 0) return;
+    buf[n] = '\0';
+
+    char *p = buf;
+    while (*p) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        char *eq = strchr(p, '=');
+        if (eq) {
+            *eq = '\0';
+            char *val = eq + 1;
+            if      (strcmp(p, "host") == 0) set(str_host, MUIA_String_Contents, val);
+            else if (strcmp(p, "port") == 0) set(str_port, MUIA_String_Contents, val);
+            else if (strcmp(p, "user") == 0) set(str_user, MUIA_String_Contents, val);
+        }
+        p = nl ? nl + 1 : p + strlen(p);
+    }
 }
 
 /* ================================================================
@@ -855,6 +954,24 @@ int main(int argc, char **argv)
     set(btn_download,   MUIA_Disabled, TRUE);
     set(btn_remote_up,  MUIA_Disabled, TRUE);
 
+    /* Tab order: Host -> Port -> User -> Pass -> Connect only.
+     * On Zune all interactive objects default to CycleChain=TRUE,
+     * so explicitly exclude every button that should not be in the cycle. */
+    set(str_host,          MUIA_CycleChain, TRUE);
+    set(str_port,          MUIA_CycleChain, TRUE);
+    set(str_user,          MUIA_CycleChain, TRUE);
+    set(str_pass,          MUIA_CycleChain, TRUE);
+    set(btn_connect,       MUIA_CycleChain, TRUE);
+    set(btn_disconnect,    MUIA_CycleChain, FALSE);
+    set(btn_upload,        MUIA_CycleChain, FALSE);
+    set(btn_download,      MUIA_CycleChain, FALSE);
+    set(btn_local_up,      MUIA_CycleChain, FALSE);
+    set(btn_local_volumes, MUIA_CycleChain, FALSE);
+    set(btn_remote_up,     MUIA_CycleChain, FALSE);
+
+    /* Pre-fill connection fields from saved prefs */
+    load_prefs();
+
     /* Close window -> quit application */
     DoMethod(win, MUIM_Notify, MUIA_Window_CloseRequest, TRUE,
              (IPTR)app, 2, MUIM_Application_ReturnID, MUIV_Application_ReturnID_Quit);
@@ -916,6 +1033,7 @@ int main(int argc, char **argv)
     /* Cleanup                                                     */
     /* ---------------------------------------------------------- */
     set(win, MUIA_Window_Open, FALSE);
+    save_prefs();
 
     if (g_ftp.connected) {
         char resp[64]; ftp_cmd("QUIT", resp, sizeof(resp));
