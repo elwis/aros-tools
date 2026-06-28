@@ -1,18 +1,14 @@
 CC       = x86_64-aros-gcc
-AROSDIR  = $(HOME)/Aros/AROS-20260626-linux-x86_64-system
-INCLUDES = -I$(AROSDIR)/Developer/include
+SYSROOT  = $(HOME)/Aros/arosbuilds/core-linux-x86_64-d/bin/linux-x86_64/AROS/Development
+INCLUDES = -I$(SYSROOT)/include
 LIBS     = -lmui
-
 TARGET   = FTPacket
-SRC      = ftpacket.c
 
-all: $(TARGET)
+$(TARGET): ftpacket.c
+	$(CC) --sysroot=$(SYSROOT) $(INCLUDES) -o $(TARGET) ftpacket.c $(LIBS)
 
-$(TARGET): $(SRC)
-	$(CC) $(INCLUDES) -o $(TARGET) $(SRC) $(LIBS)
-
-install: $(TARGET)
-	cp $(TARGET) $(AROSDIR)/Utilities/$(TARGET)
+install:
+	cp $(TARGET) $(HOME)/Aros/arosbuilds/core-linux-x86_64-d/bin/linux-x86_64/AROS/C/
 
 clean:
 	rm -f $(TARGET)

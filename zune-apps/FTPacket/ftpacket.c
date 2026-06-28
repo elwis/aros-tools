@@ -177,17 +177,24 @@ static int ftp_open_pasv(void)
     char resp[256];
     if (ftp_cmd("PASV", resp, sizeof(resp)) != 227) return -1;
 
-    const char *p = strchr(resp, '(');
-    if (!p) return -1; p++;
-
     int h1,h2,h3,h4,p1,p2;
-    if (sscanf(p, "%d,%d,%d,%d,%d,%d", &h1,&h2,&h3,&h4,&p1,&p2) != 6) return -1;
-
-    char ip[32]; snprintf(ip, sizeof(ip), "%d.%d.%d.%d", h1,h2,h3,h4);
+    const char *p = strchr(resp, '(');
+    if (p) {
+        p++;
+    } else {
+        /* No parentheses: skip the 3-digit code, then scan to the first IP digit */
+        p = resp;
+        while (*p && (*p < '0' || *p > '9')) p++;
+        while (*p >= '0' && *p <= '9') p++;
+        while (*p && (*p < '0' || *p > '9')) p++;
+    }
+    if (!*p || sscanf(p, "%d,%d,%d,%d,%d,%d", &h1,&h2,&h3,&h4,&p1,&p2) != 6) return -1;
 
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(ip);
+    /* Build address directly from parsed octets — avoids inet_addr() */
+    addr.sin_addr.s_addr = htonl(((ULONG)h1 << 24) | ((ULONG)h2 << 16) |
+                                  ((ULONG)h3 <<  8) |  (ULONG)h4);
     addr.sin_port = htons((unsigned short)((p1 << 8) | p2));
 
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -419,6 +426,7 @@ static ULONG do_connect(struct Hook *h, Object *obj, APTR msg)
     ftp_update_cwd();
     ui_set_connected(TRUE);
     remote_refresh();
+    local_refresh();
     ui_status("Connected and logged in.");
     return 0;
 }
@@ -770,15 +778,17 @@ int main(int argc, char **argv)
     DoMethod(btn_remote_up,  MUIM_Notify, MUIA_Pressed, FALSE,
              (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_remote_up_h);
 
-    /* Double-click notifications go on the ListView, not the List */
-    DoMethod(lv_local,  MUIM_Notify, MUIA_Listview_DoubleClick, TRUE,
+    /* Double-click notifications go on the ListView, not the List.
+     * MUIV_EveryTime fires on every double-click; TRUE would only fire once
+     * because Zune never resets MUIA_Listview_DoubleClick back to FALSE. */
+    DoMethod(lv_local,  MUIM_Notify, MUIA_Listview_DoubleClick, MUIV_EveryTime,
              (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_local_dbl_h);
-    DoMethod(lv_remote, MUIM_Notify, MUIA_Listview_DoubleClick, TRUE,
+    DoMethod(lv_remote, MUIM_Notify, MUIA_Listview_DoubleClick, MUIV_EveryTime,
              (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_remote_dbl_h);
 
-    /* Populate local panel and open window */
-    local_refresh();
+    /* Open window first so the list renders, then populate */
     set(win, MUIA_Window_Open, TRUE);
+    local_refresh();
 
     /* ---------------------------------------------------------- */
     /* Main event loop                                             */
