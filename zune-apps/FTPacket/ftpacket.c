@@ -25,6 +25,7 @@
 /* BSD socket — per-task SocketBase pattern required on AROS hosted networking.
  * Global SocketBase causes Exec_OpenResource crash; tc_UserData is the fix. */
 #include <sys/types.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -47,6 +48,8 @@
 #define MAX_PATH       512
 #define DIR_PREFIX    "[DIR] "
 #define DIR_PREFIX_LEN 6
+#define VOL_PREFIX    "[VOL] "
+#define VOL_PREFIX_LEN 6
 
 /* ================================================================
  * Global library bases
@@ -77,7 +80,7 @@ static Object *btn_connect, *btn_disconnect;
 static Object *lv_local,  *lst_local;
 static Object *lv_remote, *lst_remote;
 static Object *btn_upload, *btn_download;
-static Object *btn_local_up, *btn_remote_up;
+static Object *btn_local_up, *btn_local_volumes, *btn_remote_up;
 static Object *txt_local_path, *txt_remote_path;
 static Object *txt_status;
 
@@ -92,6 +95,7 @@ static struct Hook hook_disconnect_h;
 static struct Hook hook_upload_h;
 static struct Hook hook_download_h;
 static struct Hook hook_local_up_h;
+static struct Hook hook_local_vol_h;
 static struct Hook hook_remote_up_h;
 static struct Hook hook_local_dbl_h;
 static struct Hook hook_remote_dbl_h;
@@ -119,6 +123,24 @@ static BOOL net_open(void)
 static void net_close(void)
 {
     if (SocketBase) { CloseLibrary(SocketBase); SocketBase = NULL; }
+}
+
+/*
+ * recv() wrapper that pumps the Zune event loop every 50 ms so the
+ * window manager stays alive during long data transfers.
+ * All action buttons must be disabled before calling (see ui_busy).
+ */
+static int recv_pump(int s, void *buf, int len)
+{
+    for (;;) {
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(s, &rfds);
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 50000;
+        int r = select(s + 1, &rfds, NULL, NULL, &tv);
+        if (r > 0) return recv(s, buf, len, 0);
+        if (r < 0) return -1;
+        ULONG sigs = 0;
+        DoMethod(app, MUIM_Application_NewInput, (IPTR)&sigs);
+    }
 }
 
 /* ================================================================
@@ -252,6 +274,25 @@ static void ui_set_connected(BOOL on)
     set(btn_remote_up,  MUIA_Disabled, !on);
 }
 
+/* Disable all action buttons during a blocking FTP operation so the
+ * Zune event loop (pumped by recv_pump) cannot trigger re-entrant calls. */
+static void ui_busy(BOOL on)
+{
+    if (on) {
+        set(btn_connect,       MUIA_Disabled, TRUE);
+        set(btn_disconnect,    MUIA_Disabled, TRUE);
+        set(btn_upload,        MUIA_Disabled, TRUE);
+        set(btn_download,      MUIA_Disabled, TRUE);
+        set(btn_remote_up,     MUIA_Disabled, TRUE);
+        set(btn_local_up,      MUIA_Disabled, TRUE);
+        set(btn_local_volumes, MUIA_Disabled, TRUE);
+    } else {
+        set(btn_local_up,      MUIA_Disabled, FALSE);
+        set(btn_local_volumes, MUIA_Disabled, FALSE);
+        ui_set_connected(g_ftp.connected);
+    }
+}
+
 /* ================================================================
  * Local directory helpers (AmigaOS/AROS paths: VOL: or VOL:sub/dir)
  * ================================================================ */
@@ -259,6 +300,26 @@ static void ui_set_connected(BOOL on)
 static void local_refresh(void)
 {
     DoMethod(lst_local, MUIM_List_Clear);
+
+    /* Empty g_local_dir is the sentinel for "show volume list" */
+    if (g_local_dir[0] == '\0') {
+        /* LDF_ASSIGNS includes SYS:, WORK:, etc. which are assigns on AROS One,
+         * not physical volumes — without it those paths are missing from the list. */
+        ULONG ldf = LDF_VOLUMES | LDF_ASSIGNS | LDF_READ;
+        struct DosList *dl = LockDosList(ldf);
+        struct DosList *ve = NextDosEntry(dl, LDF_VOLUMES | LDF_ASSIGNS);
+        while (ve) {
+            char *name = (char *)BADDR(ve->dol_Name);
+            char entry[120];
+            snprintf(entry, sizeof(entry), VOL_PREFIX "%s:", name);
+            DoMethod(lst_local, MUIM_List_InsertSingle,
+                     entry, MUIV_List_Insert_Sorted);
+            ve = NextDosEntry(ve, LDF_VOLUMES | LDF_ASSIGNS);
+        }
+        UnLockDosList(ldf);
+        set(txt_local_path, MUIA_Text_Contents, "Volumes");
+        return;
+    }
 
     BPTR lock = Lock(g_local_dir, ACCESS_READ);
     if (!lock) { ui_status("Cannot lock local directory"); return; }
@@ -283,29 +344,39 @@ static void local_refresh(void)
     set(txt_local_path, MUIA_Text_Contents, g_local_dir);
 }
 
-/* Navigate into a subdirectory of the current local path */
+/* Navigate into a subdirectory (or volume) of the current local path */
 static void local_enter(const char *dirname)
 {
-    int len = strlen(g_local_dir);
-    if (g_local_dir[len-1] == ':') {
-        strncat(g_local_dir, dirname, MAX_PATH - len - 1);
+    if (g_local_dir[0] == '\0') {
+        /* Volume listing mode — dirname is already "VOLNAME:" */
+        strncpy(g_local_dir, dirname, MAX_PATH - 1);
+        g_local_dir[MAX_PATH - 1] = '\0';
     } else {
-        strncat(g_local_dir, "/",     MAX_PATH - len - 1);
-        strncat(g_local_dir, dirname, MAX_PATH - len - 2);
+        int len = strlen(g_local_dir);
+        if (g_local_dir[len-1] == ':') {
+            strncat(g_local_dir, dirname, MAX_PATH - len - 1);
+        } else {
+            strncat(g_local_dir, "/",     MAX_PATH - len - 1);
+            strncat(g_local_dir, dirname, MAX_PATH - len - 2);
+        }
     }
     local_refresh();
 }
 
-/* Navigate one level up */
+/* Navigate one level up; from a volume root, go to the volume list */
 static void local_up(void)
 {
+    if (g_local_dir[0] == '\0') return; /* already at volume list */
     char *slash = strrchr(g_local_dir, '/');
     if (slash) {
         *slash = '\0';
     } else {
-        /* Already at volume root: e.g. "SYS:Sub" -> "SYS:" */
         char *colon = strchr(g_local_dir, ':');
-        if (colon && *(colon+1) != '\0') *(colon+1) = '\0';
+        if (colon && *(colon+1) != '\0') {
+            *(colon+1) = '\0'; /* e.g. "SYS:sub" -> "SYS:" */
+        } else {
+            g_local_dir[0] = '\0'; /* already at root -> show volumes */
+        }
     }
     local_refresh();
 }
@@ -319,18 +390,20 @@ static void remote_refresh(void)
     if (!g_ftp.connected) return;
     DoMethod(lst_remote, MUIM_List_Clear);
 
+    ui_busy(TRUE);
+
     int ds = ftp_open_pasv();
-    if (ds < 0) { ui_status("PASV failed for LIST"); return; }
+    if (ds < 0) { ui_busy(FALSE); ui_status("PASV failed for LIST"); return; }
 
     char resp[256];
     int code = ftp_cmd("LIST", resp, sizeof(resp));
     if (code != 125 && code != 150) {
-        CloseSocket(ds); ui_status(resp); return;
+        CloseSocket(ds); ui_busy(FALSE); ui_status(resp); return;
     }
 
     /* Read listing, split on newlines, insert each line */
     char buf[FTP_DATA_BUF]; char line[512]; int lp = 0; int n;
-    while ((n = recv(ds, buf, sizeof(buf), 0)) > 0) {
+    while ((n = recv_pump(ds, buf, sizeof(buf))) > 0) {
         for (int i = 0; i < n; i++) {
             char c = buf[i];
             if (c == '\n') {
@@ -346,6 +419,7 @@ static void remote_refresh(void)
     CloseSocket(ds);
     ftp_getresp(resp, sizeof(resp)); /* consume 226 Transfer complete */
     set(txt_remote_path, MUIA_Text_Contents, g_ftp.cwd);
+    ui_busy(FALSE);
 }
 
 /* ================================================================
@@ -462,14 +536,22 @@ static ULONG do_download(struct Hook *h, Object *obj, APTR msg)
 
     char resp[256]; ftp_cmd("TYPE I", resp, sizeof(resp));
 
-    int ds = ftp_open_pasv();
-    if (ds < 0) { ui_status("PASV failed"); return 0; }
+    ui_busy(TRUE);
 
-    char cmd[MAX_PATH+16];
-    snprintf(cmd, sizeof(cmd), "RETR %s", fname);
+    int ds = ftp_open_pasv();
+    if (ds < 0) { ui_busy(FALSE); ui_status("PASV failed"); return 0; }
+
+    /* Use full remote path so the server can always locate the file */
+    char cmd[MAX_PATH*2+8];
+    int cwdlen = strlen(g_ftp.cwd);
+    if (cwdlen > 0 && g_ftp.cwd[cwdlen-1] == '/')
+        snprintf(cmd, sizeof(cmd), "RETR %s%s", g_ftp.cwd, fname);
+    else
+        snprintf(cmd, sizeof(cmd), "RETR %s/%s", g_ftp.cwd, fname);
+
     int code = ftp_cmd(cmd, resp, sizeof(resp));
     if (code != 125 && code != 150) {
-        CloseSocket(ds); ui_status(resp); return 0;
+        CloseSocket(ds); ui_busy(FALSE); ui_status(resp); return 0;
     }
 
     int ldlen = strlen(g_local_dir);
@@ -480,10 +562,10 @@ static ULONG do_download(struct Hook *h, Object *obj, APTR msg)
         fname);
 
     BPTR fh = Open(local_path, MODE_NEWFILE);
-    if (!fh) { CloseSocket(ds); ui_status("Cannot create local file"); return 0; }
+    if (!fh) { CloseSocket(ds); ui_busy(FALSE); ui_status("Cannot create local file"); return 0; }
 
     char buf[FTP_DATA_BUF]; int n; ULONG total = 0;
-    while ((n = recv(ds, buf, sizeof(buf), 0)) > 0) {
+    while ((n = recv_pump(ds, buf, sizeof(buf))) > 0) {
         Write(fh, buf, n); total += n;
     }
     Close(fh); CloseSocket(ds);
@@ -493,6 +575,7 @@ static ULONG do_download(struct Hook *h, Object *obj, APTR msg)
     snprintf(status, sizeof(status), "Downloaded '%s' (%lu bytes)", fname, total);
     ui_status(status);
     local_refresh();
+    ui_busy(FALSE);
     return 0;
 }
 
@@ -509,6 +592,8 @@ static ULONG do_upload(struct Hook *h, Object *obj, APTR msg)
     if (!entry) return 0;
     if (strncmp(entry, DIR_PREFIX, DIR_PREFIX_LEN) == 0)
         { ui_status("Cannot upload a directory"); return 0; }
+    if (strncmp(entry, VOL_PREFIX, VOL_PREFIX_LEN) == 0)
+        { ui_status("Select a file to upload, not a volume"); return 0; }
 
     /* Strip the 6-char padding prefix from file entries ("      ") */
     char *fname = entry;
@@ -526,14 +611,22 @@ static ULONG do_upload(struct Hook *h, Object *obj, APTR msg)
 
     char resp[256]; ftp_cmd("TYPE I", resp, sizeof(resp));
 
-    int ds = ftp_open_pasv();
-    if (ds < 0) { Close(fh); ui_status("PASV failed"); return 0; }
+    ui_busy(TRUE);
 
-    char cmd[MAX_PATH+16];
-    snprintf(cmd, sizeof(cmd), "STOR %s", fname);
+    int ds = ftp_open_pasv();
+    if (ds < 0) { Close(fh); ui_busy(FALSE); ui_status("PASV failed"); return 0; }
+
+    /* Use full remote path so the file lands in the correct directory */
+    char cmd[MAX_PATH*2+8];
+    int cwdlen = strlen(g_ftp.cwd);
+    if (cwdlen > 0 && g_ftp.cwd[cwdlen-1] == '/')
+        snprintf(cmd, sizeof(cmd), "STOR %s%s", g_ftp.cwd, fname);
+    else
+        snprintf(cmd, sizeof(cmd), "STOR %s/%s", g_ftp.cwd, fname);
+
     int code = ftp_cmd(cmd, resp, sizeof(resp));
     if (code != 125 && code != 150) {
-        Close(fh); CloseSocket(ds); ui_status(resp); return 0;
+        Close(fh); CloseSocket(ds); ui_busy(FALSE); ui_status(resp); return 0;
     }
 
     char buf[FTP_DATA_BUF]; LONG n; ULONG total = 0;
@@ -546,6 +639,7 @@ static ULONG do_upload(struct Hook *h, Object *obj, APTR msg)
     char status[256];
     snprintf(status, sizeof(status), "Uploaded '%s' (%lu bytes)", fname, total);
     ui_status(status);
+    /* remote_refresh calls ui_busy internally; ui_busy(FALSE) at end restores state */
     remote_refresh();
     return 0;
 }
@@ -554,6 +648,14 @@ static ULONG do_local_up(struct Hook *h, Object *obj, APTR msg)
 {
     (void)h; (void)obj; (void)msg;
     local_up();
+    return 0;
+}
+
+static ULONG do_local_volumes(struct Hook *h, Object *obj, APTR msg)
+{
+    (void)h; (void)obj; (void)msg;
+    g_local_dir[0] = '\0';
+    local_refresh();
     return 0;
 }
 
@@ -574,8 +676,11 @@ static ULONG do_local_dbl(struct Hook *h, Object *obj, APTR msg)
     if ((LONG)pos < 0) return 0;
     char *entry = NULL;
     DoMethod(lst_local, MUIM_List_GetEntry, pos, &entry);
-    if (!entry || strncmp(entry, DIR_PREFIX, DIR_PREFIX_LEN) != 0) return 0;
-    local_enter(entry + DIR_PREFIX_LEN);
+    if (!entry) return 0;
+    if (strncmp(entry, DIR_PREFIX, DIR_PREFIX_LEN) == 0)
+        local_enter(entry + DIR_PREFIX_LEN);
+    else if (strncmp(entry, VOL_PREFIX, VOL_PREFIX_LEN) == 0)
+        local_enter(entry + VOL_PREFIX_LEN);
     return 0;
 }
 
@@ -692,7 +797,8 @@ int main(int argc, char **argv)
                             End,
                         End,
                         Child, HGroup,
-                            Child, btn_local_up = SimpleButton("Parent Dir"),
+                            Child, btn_local_up      = SimpleButton("Parent Dir"),
+                            Child, btn_local_volumes  = SimpleButton("Volumes"),
                         End,
                     End,
 
@@ -761,6 +867,7 @@ int main(int argc, char **argv)
     HOOK_INIT(hook_upload_h,     do_upload);
     HOOK_INIT(hook_download_h,   do_download);
     HOOK_INIT(hook_local_up_h,   do_local_up);
+    HOOK_INIT(hook_local_vol_h,  do_local_volumes);
     HOOK_INIT(hook_remote_up_h,  do_remote_up);
     HOOK_INIT(hook_local_dbl_h,  do_local_dbl);
     HOOK_INIT(hook_remote_dbl_h, do_remote_dbl);
@@ -773,8 +880,10 @@ int main(int argc, char **argv)
              (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_upload_h);
     DoMethod(btn_download,   MUIM_Notify, MUIA_Pressed, FALSE,
              (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_download_h);
-    DoMethod(btn_local_up,   MUIM_Notify, MUIA_Pressed, FALSE,
+    DoMethod(btn_local_up,      MUIM_Notify, MUIA_Pressed, FALSE,
              (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_local_up_h);
+    DoMethod(btn_local_volumes, MUIM_Notify, MUIA_Pressed, FALSE,
+             (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_local_vol_h);
     DoMethod(btn_remote_up,  MUIM_Notify, MUIA_Pressed, FALSE,
              (IPTR)app, 2, MUIM_CallHook, (IPTR)&hook_remote_up_h);
 
