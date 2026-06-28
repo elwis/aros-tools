@@ -598,9 +598,9 @@ static ULONG do_download(struct Hook *h, Object *obj, APTR msg)
     char cmd[MAX_PATH*2+8];
     int cwdlen = strlen(g_ftp.cwd);
     if (cwdlen > 0 && g_ftp.cwd[cwdlen-1] == '/')
-        snprintf(cmd, sizeof(cmd), "RETR \"%s%s\"", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "RETR %s%s", g_ftp.cwd, fname);
     else
-        snprintf(cmd, sizeof(cmd), "RETR \"%s/%s\"", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "RETR %s/%s", g_ftp.cwd, fname);
 
     int code = ftp_cmd(cmd, resp, sizeof(resp));
     if (code != 125 && code != 150) {
@@ -673,9 +673,9 @@ static ULONG do_upload(struct Hook *h, Object *obj, APTR msg)
     char cmd[MAX_PATH*2+8];
     int cwdlen = strlen(g_ftp.cwd);
     if (cwdlen > 0 && g_ftp.cwd[cwdlen-1] == '/')
-        snprintf(cmd, sizeof(cmd), "STOR \"%s%s\"", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "STOR %s%s", g_ftp.cwd, fname);
     else
-        snprintf(cmd, sizeof(cmd), "STOR \"%s/%s\"", g_ftp.cwd, fname);
+        snprintf(cmd, sizeof(cmd), "STOR %s/%s", g_ftp.cwd, fname);
 
     int code = ftp_cmd(cmd, resp, sizeof(resp));
     if (code != 125 && code != 150) {
@@ -750,7 +750,7 @@ static ULONG do_remote_dbl(struct Hook *h, Object *obj, APTR msg)
     /* Name starts right after "[DIR] "; may contain spaces */
     const char *dname = entry + DIR_PREFIX_LEN;
     char cmd[MAX_PATH+16]; char resp[256];
-    snprintf(cmd, sizeof(cmd), "CWD \"%s\"", dname);
+    snprintf(cmd, sizeof(cmd), "CWD %s", dname);
     if (ftp_cmd(cmd, resp, sizeof(resp)) == 250) {
         ftp_update_cwd();
         remote_refresh();
