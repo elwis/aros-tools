@@ -3,7 +3,7 @@
 My AROS sandbox. Zune apps, utilities, and whatever else I end up 
 building while learning to develop for AROS on x86_64 ABIv11.
 
-Clone it, steal it, learn from it, do whatever. AROS fuckin' rocks.
+Clone it, steal it, learn from it, do whatever. AROS rocks.
 
 ## What's in here so far
 
