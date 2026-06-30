@@ -91,6 +91,24 @@ static struct Hook hook_tab_clear;
 #define HOOK_INIT(h, fn) \
     do { (h).h_Entry = HookEntry; (h).h_SubEntry = (HOOKFUNC)(fn); } while(0)
 
+/* safe strdup replacement (avoids stdlib.library strlen crash) */
+static char *my_strdup(const char *s)
+{
+    char *d;
+    size_t len;
+    if (!s) return NULL;
+    len = 0;
+    while (s[len]) len++;
+    d = malloc(len + 1);
+    if (!d) return NULL;
+    {
+        size_t i;
+        for (i = 0; i <= len; i++)
+            d[i] = s[i];
+    }
+    return d;
+}
+
 /* ------------------------------------------------------------ */
 static void fill_result_strings(char **strings, struct tab_state *t,
                                  struct result_row *entry)
@@ -155,6 +173,10 @@ static ULONG do_tab_run(struct Hook *h, Object *obj, APTR msg)
     if (slot < 0 || slot >= MAX_TABS || g_tabs[slot].alias == NULL) return 0;
 
     t = &g_tabs[slot];
+    if (!t->path || !t->path[0]) {
+        set(t->txt_status, MUIA_Text_Contents, "No database path set.");
+        return 0;
+    }
 
     sqltext = (STRPTR)DoMethod(t->sql_editor, MUIM_TextEditor_ExportText);
     if (!sqltext || !*sqltext) {
@@ -238,7 +260,7 @@ static ULONG do_tab_run(struct Hook *h, Object *obj, APTR msg)
                 memcpy(row->cols[i], val, sep - val);
                 row->cols[i][sep - val] = '\0';
             } else {
-                row->cols[i] = strdup("");
+                row->cols[i] = my_strdup("");
             }
             val = (*sep) ? sep + 1 : sep;
         }
@@ -287,6 +309,11 @@ static void run_one_query(const char *dbpath, const char *sql, char *out, int ou
     char cmd[1024];
     BPTR fsql, fout;
     LONG n;
+
+    if (!dbpath || !dbpath[0] || !sql || !sql[0] || !out) {
+        if (out) out[0] = '\0';
+        return;
+    }
 
     fsql = Open("T:arossql_s.sql", MODE_NEWFILE);
     if (!fsql) { out[0] = '\0'; return; }
@@ -339,7 +366,7 @@ static ULONG do_tab_schema(struct Hook *h, Object *obj, APTR msg)
         eol = strchr(line, '\n');
         if (!eol) eol = line + strlen(line);
         *eol = '\0';
-        val = strdup(line);
+        val = my_strdup(line);
         if (val) DoMethod(t->lst_tables, MUIM_List_InsertSingle, val, MUIV_List_Insert_Bottom);
         i++;
         line = *eol ? eol + 1 : NULL;
@@ -383,7 +410,7 @@ static void refresh_columns(struct tab_state *t, const char *tablename)
                 {
                     char entry[256];
                     snprintf(entry, sizeof(entry), "%-24s %s", name_col, type_col);
-                    char *dup = strdup(entry);
+                    char *dup = my_strdup(entry);
                     if (dup) DoMethod(t->lst_cols, MUIM_List_InsertSingle, dup, MUIV_List_Insert_Bottom);
                 }
                 if (next) *next = '|';
@@ -442,6 +469,9 @@ static void rebuild_titles(void)
 {
     int j = 0;
     int i;
+
+    /* welcome is always child #0 */
+    active_titles[j++] = "Welcome";
     for (i = 0; i < MAX_TABS; i++) {
         if (g_tabs[i].alias != NULL)
             active_titles[j++] = g_tabs[i].alias;
@@ -454,13 +484,19 @@ static void rebuild_titles(void)
 static void tab_open(const char *alias, const char *path, int conn_idx)
 {
     int slot;
+    if (!alias || !alias[0] || !path || !path[0]) return;
     for (slot = 0; slot < MAX_TABS; slot++)
         if (g_tabs[slot].alias == NULL) break;
     if (slot >= MAX_TABS) return;
 
     struct tab_state *t = &g_tabs[slot];
-    t->alias = strdup(alias);
-    t->path  = strdup(path);
+    t->alias = my_strdup(alias);
+    t->path  = my_strdup(path);
+    if (!t->alias || !t->path) {
+        free(t->alias); free(t->path);
+        t->alias = NULL; t->path = NULL;
+        return;
+    }
     t->conn_idx = conn_idx;
     t->num_cols = 0;
     memset(t->col_names, 0, sizeof(t->col_names));
@@ -565,10 +601,6 @@ static void tab_open(const char *alias, const char *path, int conn_idx)
     DoMethod(tab_register, OM_ADDMEMBER, t->page);
     rebuild_titles();
     g_tab_count++;
-
-    if (txt_welcome)
-        set(txt_welcome, MUIA_ShowMe, FALSE);
-    set(tab_register, MUIA_ShowMe, TRUE);
 }
 
 static void tab_close(int slot)
@@ -615,11 +647,6 @@ static void tab_close(int slot)
 
     rebuild_titles();
     g_tab_count--;
-
-    if (g_tab_count == 0 && txt_welcome) {
-        set(txt_welcome, MUIA_ShowMe, TRUE);
-        set(tab_register, MUIA_ShowMe, FALSE);
-    }
 }
 
 /* ------------------------------------------------------------ */
@@ -659,12 +686,14 @@ static void load_connections(void)
         if (!nl) nl = line + strlen(line);
         *nl = '\0';
         sep = strchr(line, '|');
-        if (sep) {
+        if (sep && line[0] && sep[1]) {
             *sep = '\0';
             conn_add(line, sep + 1);
         }
         line = *nl ? nl + 1 : line + (*line ? strlen(line) : 0);
     }
+    /* delete corrupted prefs if nothing loaded */
+    if (g_conn_count == 0) DeleteFile(PREFS_FILE);
 }
 
 static void save_history(const char *dbpath, const char *sql)
@@ -674,6 +703,8 @@ static void save_history(const char *dbpath, const char *sql)
     struct tm *ltm;
     char line[2048], ts[64];
     int len;
+
+    if (!dbpath || !sql) return;
 
     now = time(NULL);
     ltm = localtime(&now);
@@ -703,10 +734,16 @@ static void save_history(const char *dbpath, const char *sql)
 /* ------------------------------------------------------------ */
 static void conn_add(const char *alias, const char *path)
 {
+    if (!alias || !alias[0] || !path || !path[0]) return;
     if (g_conn_count >= MAX_CONNECTIONS) return;
     struct conn_entry *e = &g_conns[g_conn_count++];
-    e->alias = strdup(alias);
-    e->path  = strdup(path);
+    e->alias = my_strdup(alias);
+    e->path  = my_strdup(path);
+    if (!e->alias || !e->path) {
+        free(e->alias); free(e->path);
+        g_conn_count--;
+        return;
+    }
     DoMethod(lst_conn, MUIM_List_InsertSingle, e, MUIV_List_Insert_Bottom);
 }
 
@@ -725,12 +762,15 @@ static AROS_UFH3(void, disp_conn_func,
 /* ------------------------------------------------------------ */
 static void filename_to_alias(const char *path, char *out, int outlen)
 {
-    const char *name = path;
-    const char *p = path;
+    const char *name, *p;
+    char *dot;
+    if (!path || !out || outlen <= 0) return;
+    name = path;
+    p = path;
     while (*p) { if (*p == '/' || *p == ':') name = p + 1; p++; }
-    strncpy(out, name, outlen - 1);
-    out[outlen - 1] = '\0';
-    char *dot = strrchr(out, '.');
+    out[0] = '\0';
+    strncat(out, name, outlen - 1);
+    dot = strrchr(out, '.');
     if (dot && (strcasecmp(dot, ".db") == 0 ||
                 strcasecmp(dot, ".sqlite") == 0 ||
                 strcasecmp(dot, ".sqlite3") == 0))
@@ -749,9 +789,43 @@ static void pick_and_add(void)
     if (!fr) return;
     if (AslRequest(fr, NULL)) {
         char full[512], alias[128];
-        strncpy(full, fr->rf_Dir, sizeof(full) - 1);
-        full[sizeof(full) - 1] = '\0';
-        strncat(full, fr->rf_File, sizeof(full) - strlen(full) - 1);
+        const char *dir, *file;
+        dir  = (const char *)fr->rf_Dir;
+        file = (const char *)fr->rf_File;
+        if (!dir || !file || !dir[0] || !file[0]) { FreeAslRequest(fr); return; }
+        full[0] = '\0';
+        strncat(full, dir, sizeof(full) - 1);
+        strncat(full, file, sizeof(full) - strlen(full) - 1);
+        if (!full[0]) { FreeAslRequest(fr); return; }
+        filename_to_alias(full, alias, sizeof(alias));
+        if (alias[0]) {
+            conn_add(alias, full);
+            save_connections();
+        }
+    }
+    FreeAslRequest(fr);
+}
+
+/* Add: allow creating new DB (file doesn't need to exist yet) */
+static void pick_and_create(void)
+{
+    struct FileRequester *fr;
+    fr = (struct FileRequester *)AllocAslRequestTags(ASL_FileRequest,
+        ASLFR_TitleText,     "Name for new SQLite Database",
+        ASLFR_DoSaveMode,    TRUE,
+        ASLFR_InitialDrawer, "SYS:",
+        TAG_END);
+    if (!fr) return;
+    if (AslRequest(fr, NULL)) {
+        char full[512], alias[128];
+        const char *dir, *file;
+        dir  = (const char *)fr->rf_Dir;
+        file = (const char *)fr->rf_File;
+        if (!dir || !file || !dir[0] || !file[0]) { FreeAslRequest(fr); return; }
+        full[0] = '\0';
+        strncat(full, dir, sizeof(full) - 1);
+        strncat(full, file, sizeof(full) - strlen(full) - 1);
+        if (!full[0]) { FreeAslRequest(fr); return; }
         filename_to_alias(full, alias, sizeof(alias));
         if (alias[0]) {
             conn_add(alias, full);
@@ -764,7 +838,7 @@ static void pick_and_add(void)
 static ULONG do_add(struct Hook *h, Object *obj, APTR msg)
 {
     (void)h; (void)obj; (void)msg;
-    pick_and_add();
+    pick_and_create();
     return 0;
 }
 
@@ -810,11 +884,11 @@ static ULONG do_browse(struct Hook *h, Object *obj, APTR msg)
 static ULONG do_conn_dbl(struct Hook *h, Object *obj, APTR msg)
 {
     (void)h; (void)obj; (void)msg;
+    struct conn_entry *e = NULL;
     IPTR pos = XGET(lst_conn, MUIA_List_Active);
     if ((LONG)pos < 0) return 0;
-    struct conn_entry *e = NULL;
     DoMethod(lst_conn, MUIM_List_GetEntry, pos, &e);
-    if (!e) return 0;
+    if (!e || !e->alias || !e->path) return 0;
     tab_open(e->alias, e->path, (int)pos);
     return 0;
 }
@@ -829,7 +903,8 @@ int main(void)
         g_tabs[i].conn_idx = -1;
         g_tabs[i].num_cols = 0;
     }
-    active_titles[0] = NULL;
+    active_titles[0] = "Welcome";
+    active_titles[1] = NULL;
 
     MUIMasterBase = OpenLibrary("muimaster.library", 0);
     if (!MUIMasterBase) return 1;
@@ -864,10 +939,8 @@ int main(void)
                     Child, lv_conn = ListviewObject,
                         MUIA_Listview_List, lst_conn = ListObject,
                             InputListFrame,
-                            MUIA_List_ConstructHook, MUIV_List_ConstructHook_String,
-                            MUIA_List_DestructHook,  MUIV_List_DestructHook_String,
-                            MUIA_List_DisplayHook,   &hook_disp_conn,
-                            MUIA_List_Format,        "",
+                            MUIA_List_DisplayHook, &hook_disp_conn,
+                            MUIA_List_Format,      "",
                         End,
                     End,
 
@@ -878,19 +951,18 @@ int main(void)
                     End,
                 End,
 
-                Child, VGroup,
-                    Child, txt_welcome = TextObject,
-                        TextFrame,
-                        MUIA_Text_Contents,
-                            "Welcome to AROSQL\n\n"
-                            "Browse or Add a connection on the left,\n"
-                            "then double-click to open a query tab.",
-                    End,
+                Child, tab_register = RegisterObject,
+                    MUIA_Register_Titles, active_titles,
+                    MUIA_Register_Frame,  TRUE,
 
-                    Child, tab_register = RegisterObject,
-                        MUIA_Register_Titles, active_titles,
-                        MUIA_Register_Frame,  TRUE,
-                        MUIA_ShowMe,          FALSE,
+                    Child, VGroup,
+                        Child, txt_welcome = TextObject,
+                            TextFrame,
+                            MUIA_Text_Contents,
+                                "Welcome to AROSQL\n\n"
+                                "Browse or Add a connection on the left,\n"
+                                "then double-click to open a query tab.",
+                        End,
                     End,
                 End,
 

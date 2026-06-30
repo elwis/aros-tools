@@ -1,5 +1,7 @@
 # AROS Development Setup
 
+This is my personal guide, might contain errors or hallucinations..
+
 How to get a working AROS x86_64 (ABIv11) development environment on 
 Linux, from zero to compiling and running your own Zune apps.
 
@@ -85,8 +87,7 @@ cd ~/arosbuilds/core-linux-x86_64-d/bin/linux-x86_64/AROS
 ```
 
 This is a real AROS desktop running as a Linux process. Good for fast 
-iteration but it has **no network stack** — fine for GUI/file work, 
-useless for testing networked apps.
+iteration but it seems it has **no network-stack**
 
 ---
 
@@ -124,11 +125,11 @@ AROS/Amiga headers instead (`proto/bsdsocket.h` etc).
 
 ## 7. Testing with networking — AROS One in VirtualBox
 
-Hosted AROS has no network. For anything that needs sockets (FTP 
+Hosted AROS has no network what i can understand. For anything that needs sockets (FTP 
 clients, etc), test in a real AROS distro inside a VM instead.
 
-[AROS One](https://www.aros-exec.org) is the recommended starting 
-distro — most complete, preconfigured, good software selection.
+[AROS One](https://www.aros-exec.org) is the starting 
+distro I chose — preconfigured, good software selection.
 
 ### VirtualBox network configuration that actually works
 
